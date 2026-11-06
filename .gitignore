@@ -1,0 +1,5 @@
+sync.json
+*.pdf
+*.png
+__pycache__/
+logs/*.md

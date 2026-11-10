@@ -13,10 +13,13 @@ Si falta alguna, no toques Y-Click: informá exactamente cuál falta y mandá ig
 ## Flujo
 1. Verificá que las cuatro variables de entorno existen.
 2. Ejecutá el script principal: `/usr/bin/python3 -I scripts/bot_yclick.py <sync_id>`.
-   - El script lee el sync de Wells, carga cada celda en Y-Click con Playwright y manda `progreso` y `resultado` a Wells por sí solo. No repitas esas llamadas manualmente.
-   - Usá `/usr/bin/python3` (Python 3.13 con Playwright). `/usr/local/bin/python3` no tiene Playwright.
+   - El script lee el sync de Wells, carga cada celda en Y-Click con Playwright, manda `progreso` después de cada celda y `resultado` al finalizar todas — por sí solo. No repitas esas llamadas manualmente.
+   - `resultado` cierra el sync en Wells. Sin ese llamado el sync queda en «En proceso» indefinidamente.
+   - Usá `/usr/bin/python3` (Python 3.13 con Playwright 1.65). `/usr/local/bin/python3` (3.11) no tiene Playwright.
+   - Chromium pre-instalado: `/opt/pw-browsers/chromium-1243/chrome-linux64/chrome`. Siempre pasar `executable_path` y `args=["--no-sandbox"]`.
    - Si el sync no está en `en_proceso`, el script sale solo (código 0). No reabras ni sobrescribas un sync finalizado.
-3. Si `bot_yclick.py` termina con error de proceso (código ≠ 0 y ≠ 2) y no hay evidencia de que ya mandó el `resultado` a Wells (el script lo imprime en stdout), mandá vos el resultado con `wells_api.py resultado` con las celdas que se conocen y `estado: fallido`.
+   - Por cada celda: descarga el PDF, carga la cantidad, hace «Enviar a aprobar», adjunta el PDF y guarda el doc_respaldo. Ver `docs/yclick-bot-pasos.md` para el flujo detallado de cada paso.
+3. Si `bot_yclick.py` termina con error de proceso (código ≠ 0 y ≠ 2) y no hay evidencia de que ya mandó el `resultado` a Wells (el script lo imprime en stdout al enviarlo), mandá vos el resultado con `wells_api.py resultado <sync_id> payload.json` con las celdas que se conocen y `estado: fallido`. El campo `estado` es obligatorio — HTTP 422 sin él.
 4. Ante un fallo de red ambiguo en un POST, leé primero el estado del sync antes de reintentar, y reintentá como máximo 2 veces con el mismo cuerpo.
 
 ## Respuesta final a Wells (obligatoria en todas las corridas)

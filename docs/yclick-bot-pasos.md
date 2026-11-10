@@ -1,6 +1,6 @@
 # Y-Click — pasos de carga para el bot (v1, armado con el video del parte 23359)
 
-> **Estado:** recorrido completo visto en video (carga del parte 23359, pozo SOil-402(h), domingo 01/11/2026, equipo HO29) y ejecutado en prod (sync 7a878343, parte 23509, 10/11/2026). Lo marcado con **⚠️** no se vio o hay que confirmarlo con Fabio.
+> **Estado:** recorrido completo visto en video (carga del parte 23359, pozo SOil-402(h), domingo 01/11/2026, equipo HO29) y ejecutado en prod (sync 7a878343 parte 23509 y sync d69fa947 parte 23509, 10/11/2026 — colector LOC 56, posición 31, 9H, PDF + doc_respaldo LC3). Lo marcado con **⚠️** no se vio o hay que confirmarlo con Fabio.
 > Este documento es la base de las instrucciones del bot. Wells le da los datos; el bot no decide nada.
 
 ---
@@ -108,28 +108,90 @@ La carga se hace en **PARTE DE TRABAJO**. Esta pestaña está activa por defecto
 3. Si la posición o la línea no existen: `posicion_no_encontrada` o `linea_no_encontrada`.
 
 ### Paso 5 — Cargar la cantidad
-1. Navegar al día de la celda con el navegador de día (flechas anterior/siguiente).
-2. Escribir la cantidad en la caja. Leer la caja y confirmar que muestra exactamente el valor.
-3. Si la caja ya tenía un valor: `ya_existia`.
+
+**Navegación al día (confirmado en prod):**
+- El date picker tiene clase `div.calendar-container`. Puede haber varios en el DOM; el visible se detecta con `c.offsetParent !== null && c.getBoundingClientRect().height > 0`.
+- El picker suele estar fuera del viewport (y > 900 en viewport de 900px). **No usar `page.mouse.click()`** para los botones de navegación — el click no llega. Usar `page.evaluate()` y llamar `.click()` sobre los elementos dentro del JS.
+- La navegación usa `div[aria-hidden="true"]` hijos directos del `calendar-container` (`:scope > div[aria-hidden="true"]`): índice [0] = `<<`, [1] = `<` (día anterior), [2] = `>` (día siguiente), [3] = `>>`.
+- El día actual se lee del div `.date-container` o `#calendar-div` dentro del picker; extraer con regex `(\d{1,2})\s+de`.
+- Hacer scroll al picker antes de navegar: `visCal.scrollIntoView({block: 'center'})`.
+
+**Escritura de la cantidad:**
+1. Navegar al día correcto (ver arriba).
+2. Hacer click en la caja de cantidad de la celda y limpiar con `Control+a` antes de escribir.
+   - `triple_click()` no existe en este ElementHandle de Playwright 1.65 — usar `click()` + `Control+a` + `fill()`.
+3. Leer la caja y confirmar que muestra exactamente el valor.
+4. Si la caja ya tenía un valor: `ya_existia`.
 
 ### Paso 6 — Enviar
-1. Verificar (regla 2).
-2. Pulsar **Enviar a aprobar**. Tras enviar, el valor queda en verde y el botón se deshabilita.
-3. **Sin enviar no se guardan las horas ni se pueden adjuntar archivos.**
+
+1. Verificar (regla 2): leer en pantalla ubicación, posición, línea, día y cantidad; comparar con el payload.
+2. Pulsar **Tab** para quitar el foco del input de cantidad — el botón «Enviar a aprobar» no se habilita mientras el input tiene foco.
+3. Buscar y pulsar **«Enviar a aprobar»**:
+   - El botón puede aparecer varias veces en el DOM. Las primeras instancias suelen estar `disabled` o fuera del viewport. Iterar sobre todos los `button:has-text('Enviar a aprobar')`, verificar `is_enabled()` y `bounding_box()["y"] > 100` (el que tiene y < 100 está fuera del área visible), y hacer scroll + click via JS `b.scrollIntoView()` + `b.click()`.
+   - Esperar hasta 10 segundos reintentando cada 0.5s antes de declarar error.
+4. Tras enviar: el valor queda en verde y el botón se deshabilita.
+5. **Sin enviar no se guardan las horas ni se pueden adjuntar archivos ni el doc_respaldo.**
 
 ### Paso 7 — Documento de respaldo (opcional, recomendado)
-1. Ícono de **código de barras** de la fila.
-2. Cargar `doc_respaldo` del payload (ej. `LC3`).
-3. Guardar. Si el payload no trae `doc_respaldo`, omitir.
+
+Si el payload trae `doc_respaldo` (ej. `LC3`), cargarlo **después** de «Enviar a aprobar».
+
+**Flujo UI (confirmado en prod):**
+1. Los íconos de la fila están ordenados de izquierda a derecha (todos con x > 1050, ordenar por `bounding_box().x`):
+   - **[0]** clase `supporting_document` → doc_respaldo
+   - **[1]** clase `button_send_work_report` → Enviar a aprobar (mismo que el botón superior)
+   - **[2]** clase `button_work_report` → modal Archivos adjuntos
+   - **[3]** clase `button_work_report` → notas
+   - **[4]** clase `button_work_report_menu` → menú ⋮
+2. Click en el **1er ícono** (supporting_document). Se abre el modal **«Identificador de Documento de Respaldo»**.
+3. El modal tiene un `input[name='identifier']` (placeholder: «Ingrese el documento de respaldo») y campos de fecha (pre-cargados con la fecha de la celda).
+4. **Escribir el código**: hacer `page.mouse.click()` en las coordenadas reales del input (usar `bounding_box()`) para darle foco, luego `page.keyboard.press("Control+a")` y `page.keyboard.type(doc_respaldo)`.
+   - **El setter nativo de JS no funciona** con React: `Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set` llena el DOM pero React no detecta el cambio → el botón «Guardar» queda deshabilitado.
+   - `inp.fill()` sin click previo tampoco funciona — siempre hacer mouse click primero.
+5. Click en «**Guardar**». El modal se cierra si el valor fue reconocido.
+6. Si el payload no trae `doc_respaldo`, omitir este paso.
 
 ### Paso 8 — Adjuntar el PDF del parte
-1. Descargar el PDF desde la `url_firmada` a un archivo local.
-2. Ícono de **documento** de la fila. Usar la sección de archivos **de la línea** (no «Archivos de la solicitud»).
-3. «Agregar adjunto» → seleccionar archivo → «Agregar» → esperar aviso «Adjuntando archivos».
-4. Verificar que el archivo sigue en la lista → Salir.
+
+**El PDF es obligatorio.** No cargar una celda sin adjuntar el parte.
+
+**Flujo UI (confirmado en prod):**
+1. Descargar el PDF desde la `url_firmada` a un archivo local con `wells_api.py download`.
+2. Click en el **3er ícono** de la fila (clase `button_work_report`, el más a la izquierda de los íconos con esa clase — x ≈ 1193). Se abre el modal **«Archivos adjuntos»**.
+3. El modal tiene dos secciones (acordeón):
+   - **«Archivos de la solicitud»** (1a) — para adjuntos de toda la solicitud.
+   - **«Archivos '[descripción de línea]'»** (2a) — para adjuntos de **esta línea**. Expandir esta.
+4. En la sección de la línea, hacer click en «**Agregar adjunto**» (o el botón de paperclip). Aparece un `input[type=file]`.
+5. Usar `input.set_input_files(pdf_path)` — no simular click en el input de archivo.
+6. Click en el botón **«Agregar»** (distinto del «Agregar adjunto»). Aparece el aviso «Adjuntando archivos».
+7. Esperar a que el aviso desaparezca y verificar que el nombre del PDF aparece en la lista.
+8. **Si el PDF no queda en lista**: `error` con motivo `adjunto_no_confirmado`.
 
 ### Paso 9 — Resultado
-Por cada celda: `ok`, `ya_existia` o `error`. Enviar progreso a Wells después de cada una y resultado final al terminar todas.
+
+Por cada celda: `ok`, `ya_existia` o `error`.
+
+- **Después de cada celda**: llamar `wells_api.py progreso <sync_id> payload.json` (actualización intermedia, no cierra el sync).
+- **Al terminar todas las celdas**: llamar `wells_api.py resultado <sync_id> payload.json` con el payload final. **Este llamado cierra el sync.** Sin él, el sync queda en «En proceso» indefinidamente.
+
+**Formato del payload de resultado** (campo `estado` obligatorio — HTTP 422 sin él):
+```json
+{
+  "estado": "completado | parcial | fallido",
+  "celdas": [
+    {
+      "celda_id": "uuid",
+      "resultado": "ok | ya_existia | error",
+      "motivo": "texto_clave_opcional",
+      "detalle": "Texto libre"
+    }
+  ]
+}
+```
+- `estado` es `completado` solo si **todas** las celdas son `ok` o `ya_existia`.
+- Si hay al menos una `ok` y al menos una `error`: `parcial`.
+- Si todas son `error`: `fallido`.
 
 ---
 
@@ -148,6 +210,18 @@ Los campos de selección en Y-Click son React Selects (no `<select>` HTML). Para
 2. `input[type='text']` del contenedor → `.fill(termino_busqueda)`.
 3. Esperar 1500ms para que aparezcan las opciones (`[class*='-option']`).
 4. Click en la opción con el texto buscado (coincidencia case-insensitive parcial).
+
+### Inputs de texto en modales (React)
+Los inputs de modales (ej. doc_respaldo, cantidad) son inputs React. Para que el componente detecte el cambio:
+- **Usar `page.mouse.click()` en las coordenadas reales** (`bounding_box()`) para dar foco.
+- Luego `page.keyboard.press("Control+a")` + `page.keyboard.type(valor)`.
+- **No usar el setter nativo de JS** (`Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set`): llena el DOM pero React no actualiza su estado interno → botones de guardar quedan deshabilitados.
+- `ElementHandle.triple_click()` no existe en Playwright 1.65 (error `'ElementHandle' object has no attribute 'triple_click'`). Reemplazar con `click()` + `Control+a`.
+
+### Elementos fuera del viewport
+- Si un elemento tiene `bounding_box()["y"] > viewport_height` o `< 0`, el click de mouse no llega.
+- Para navegación de pickers y otros elementos fuera del viewport: usar siempre `element.evaluate("el => el.click()")` o `page.evaluate()` con `.click()` en el JS.
+- Para detectar si un picker es el visible (cuando hay varios en el DOM): `c.offsetParent !== null && c.getBoundingClientRect().height > 0`.
 
 ### Wells API
 - Toda comunicación con Wells se hace con `wells_api.py`:
@@ -221,7 +295,7 @@ Se dicen acá para que el bot sepa que **no** las decide él:
 
 - [ ] ⚠️ Botones del modal «Agregar ubicación»: cuál se usa y qué hace «Agregar y posicionar».
 - [ ] ⚠️ Partes que no son de un pozo (plantas): qué tipo de ubicación usan.
-- [ ] ⚠️ Avioncito de la fila vs. «Enviar a aprobar».
+- [x] Íconos de la fila: orden confirmado en prod (supporting_document=0, send_work_report=1, archivos=2, notas=3, menú=4).
 - [ ] Un caso con horas al 50% o 100%, y uno con KM.
 - [ ] Qué muestra Y-Click ante un error o un duplicado.
 - [x] Fin de semana: posición 25 con cantidad en días; con dos pozos el mismo día se reparte (ver sección 7).
@@ -233,3 +307,7 @@ Se dicen acá para que el bot sepa que **no** las decide él:
 - [x] Mapeo COLECTOR LOC 56 → Locación - OyM / LOCACION N° 56 / LA AMARGA CHICA (confirmado en prod 10/11/2026).
 - [x] Navegación a bandeja: ir a «Consultar Bandeja» → JS click Buscar → EN CURSO (no buscar EN CURSO desde home).
 - [x] Chromium: usar `/opt/pw-browsers/chromium-1243/chrome-linux64/chrome` con `executable_path`.
+- [x] Date picker: navegar con JS (`ariaDivs[1/2].click()` dentro de `page.evaluate()`) — el picker puede estar fuera del viewport (confirmado en prod 10/11/2026).
+- [x] Doc_respaldo: 1er ícono → modal «Identificador de Documento de Respaldo» → `input[name='identifier']` → mouse click + keyboard.type (NO JS setter) → Guardar (confirmado en prod 10/11/2026).
+- [x] PDF adjunto: 3er ícono → modal «Archivos adjuntos» → expandir 2a sección → `input[type=file]` con `set_input_files()` → «Agregar» (confirmado en prod 10/11/2026).
+- [x] Resultado Wells: `wells_api.py resultado` con campo `estado` obligatorio (HTTP 422 sin él). Sin llamar `resultado`, el sync queda «En proceso» indefinidamente (confirmado en prod 10/11/2026).

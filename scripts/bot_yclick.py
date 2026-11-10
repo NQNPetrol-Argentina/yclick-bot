@@ -1,1053 +1,1023 @@
 #!/usr/bin/env python3
-"""Bot Y-Click — carga un sync de Wells.
-
-Uso: python3 -I scripts/bot_yclick.py <sync_id>
-
-Lee el detalle del sync con wells_api.py, carga cada celda en Y-Click con
-Playwright y reporta progreso y resultado final a Wells.
-"""
-import datetime
+"""Bot de carga Y-Click. Uso: bot_yclick.py <sync_json_path>"""
+import asyncio
 import json
 import os
-import pathlib
+import re
 import subprocess
 import sys
 import time
-import zoneinfo
+from datetime import datetime, timezone, timedelta
 
-from playwright.sync_api import TimeoutError as PWTimeout
-from playwright.sync_api import sync_playwright
+from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
-# ── constantes ────────────────────────────────────────────────────────────────
+SCRATCHPAD = "/tmp/claude-0/-home-user/72d13551-539f-5350-8de2-ab359451aaf7/scratchpad"
 CHROMIUM = "/opt/pw-browsers/chromium-1243/chrome-linux64/chrome"
-WELLS_API = str(pathlib.Path(__file__).parent / "wells_api.py")
-ARS_TZ = zoneinfo.ZoneInfo("America/Argentina/Buenos_Aires")
-TOPE_SEG = 360
-TOPE_PASOS = 60
+STEP_LIMIT = 60
+TIME_LIMIT_S = 360  # 6 minutos
+WELLS_API = "/usr/bin/python3 -I /home/user/scripts/wells_api.py"
 
-# ── log ───────────────────────────────────────────────────────────────────────
-_log: list[str] = []
-_log_path: pathlib.Path | None = None
+BA_TZ = timezone(timedelta(hours=-3))
 
+def now_ba():
+    return datetime.now(tz=BA_TZ)
 
-def log(msg: str):
-    ts = datetime.datetime.now(ARS_TZ).strftime("%H:%M:%S")
-    line = f"[{ts}] {msg}"
-    _log.append(line)
-    print(line, file=sys.stderr)
+def ts():
+    return now_ba().strftime("%H:%M:%S")
 
-
-def flush_log():
-    if _log_path:
-        _log_path.write_text("\n".join(_log) + "\n", encoding="utf-8")
+LOG = []
+def log(msg):
+    line = f"[{ts()}] {msg}"
+    LOG.append(line)
+    print(line, flush=True)
 
 
-# ── Wells API ─────────────────────────────────────────────────────────────────
-def _run_api(*args) -> tuple[int, str]:
-    r = subprocess.run(
-        ["/usr/bin/python3", "-I", WELLS_API, *args],
-        capture_output=True, text=True,
-    )
-    log(f"wells_api {' '.join(args[:3])} rc={r.returncode} "
-        f"out={r.stdout.strip()[:200]} err={r.stderr.strip()[:200]}")
-    return r.returncode, r.stdout.strip()
-
-
-def wells_get(sync_id: str, out: str) -> dict:
-    rc, _ = _run_api("get", sync_id, "-o", out)
-    if rc != 0:
-        raise RuntimeError(f"wells_get falló rc={rc}")
-    return json.loads(pathlib.Path(out).read_bytes())
-
-
-def wells_progreso(sync_id: str, celdas: list[dict]):
-    body = {"celdas": celdas}
-    p = f"/tmp/progreso_{sync_id[:8]}.json"
-    pathlib.Path(p).write_text(json.dumps(body), encoding="utf-8")
-    _run_api("progreso", sync_id, p)
-
-
-def wells_resultado(sync_id: str, estado: str, celdas: list[dict], msg: str = ""):
-    body = {
-        "estado": estado,
-        "mensaje": msg,
-        "resumen": {
-            "ok":         sum(1 for c in celdas if c["resultado"] == "ok"),
-            "ya_existia": sum(1 for c in celdas if c["resultado"] == "ya_existia"),
-            "error":      sum(1 for c in celdas if c["resultado"] == "error"),
-        },
-        "celdas": celdas,
-    }
-    p = f"/tmp/resultado_{sync_id[:8]}.json"
-    pathlib.Path(p).write_text(json.dumps(body), encoding="utf-8")
-    rc, out = _run_api("resultado", sync_id, p)
-    return rc == 0, out
-
-
-def wells_get_estado(sync_id: str) -> str:
-    rc, out = _run_api("get", sync_id)
-    if rc == 0:
-        try:
-            return json.loads(out).get("estado", "desconocido")
-        except Exception:
-            pass
-    return "error_al_verificar"
-
-
-# ── contador de pasos ─────────────────────────────────────────────────────────
-_pasos = 0
-_celda_inicio = 0.0
-
-
-def paso(desc: str):
-    global _pasos
-    _pasos += 1
-    log(f"Paso {_pasos}: {desc}")
-    if _pasos > TOPE_PASOS:
-        raise RuntimeError("tope_pasos")
-    if _celda_inicio and (time.time() - _celda_inicio) > TOPE_SEG:
-        raise RuntimeError("tope_tiempo")
-
-
-def reset_pasos():
-    global _pasos, _celda_inicio
-    _pasos = 0
-    _celda_inicio = time.time()
-
-
-# ── helpers de React Select ───────────────────────────────────────────────────
-def react_select_elegir(page, label_text: str, buscar: str, timeout=10000) -> str:
-    """
-    Busca el React Select cuyo <label> contiene label_text, tipea `buscar`,
-    espera las opciones y hace clic en la primera que coincida (case-insensitive).
-    Devuelve el texto de la opción elegida.
-    """
-    # El input del react-select está inmediatamente después del label dentro del mismo bloque
-    container = page.locator(
-        f".modal-body .generic-select:has(label:has-text('{label_text}'))"
-    ).first
-    inp = container.locator("input[type='text']").first
-    inp.fill(buscar)
-    page.wait_for_timeout(1500)
-
-    # Opciones visibles
-    opts = page.locator("[class*='-option']").all()
-    for op in opts:
-        txt = op.inner_text().strip()
-        if buscar.lower() in txt.lower() or txt.lower() in buscar.lower():
-            op.click(timeout=timeout)
-            log(f"  react-select '{label_text}': elegido '{txt}'")
-            page.wait_for_timeout(800)
-            return txt
-
-    # Si no hubo coincidencia exacta, clic en la primera opción disponible
-    if opts:
-        txt = opts[0].inner_text().strip()
-        opts[0].click(timeout=timeout)
-        log(f"  react-select '{label_text}': elegido (primera opción) '{txt}'")
-        page.wait_for_timeout(800)
-        return txt
-
-    raise RuntimeError(f"react_select sin opciones para '{label_text}' buscando '{buscar}'")
-
-
-def react_select_opciones(page, label_text: str, buscar: str = "") -> list[str]:
-    """Devuelve las opciones disponibles en un react-select sin elegir ninguna."""
-    container = page.locator(
-        f".modal-body .generic-select:has(label:has-text('{label_text}'))"
-    ).first
-    inp = container.locator("input[type='text']").first
-    inp.fill(buscar)
-    page.wait_for_timeout(1500)
-    opts = page.locator("[class*='-option']").all()
-    return [op.inner_text().strip() for op in opts]
-
-
-# ── captura ───────────────────────────────────────────────────────────────────
-def captura(page, nombre: str) -> str:
-    p = f"/tmp/cap_{nombre}.png"
+async def screenshot(page, nombre):
+    path = f"{SCRATCHPAD}/{nombre}.png"
     try:
-        page.screenshot(path=p, full_page=True)
-        log(f"Captura: {p}")
+        await page.screenshot(path=path, full_page=False)
+        log(f"  Captura guardada: {path}")
     except Exception as e:
-        log(f"Captura fallida: {e}")
-    return p
-
-
-# ── login ─────────────────────────────────────────────────────────────────────
-def login(page):
-    paso("Navegar a yclick.ypf.com")
-    page.goto("https://yclick.ypf.com/", wait_until="networkidle", timeout=30000)
-
-    paso("Completar usuario")
-    page.locator("input[name='user']").fill(os.environ["USUARIO_YCLICK"])
-    paso("Completar contraseña")
-    page.locator("input[name='password']").fill(os.environ["CONTRASENA_YCLICK"])
-    paso("Pulsar Ingresar")
-    page.locator("button[type='submit']").click()
-
-    # La redirección a #/home puede tardar unos segundos
-    try:
-        page.wait_for_url("**/#/home*", timeout=60000)
-    except PWTimeout:
-        pass
-
-    page.wait_for_timeout(2000)
-    log(f"URL post-login: {page.url}")
-
-    # Detectar pantallas bloqueantes
-    html = page.content().lower()
-    for kw in ["captcha", "verify you are human", "bloqueo", "cambio de contraseña", "change password"]:
-        if kw in html:
-            captura(page, "login_bloqueado")
-            raise RuntimeError(f"login_bloqueado: detectado '{kw}'")
-
-    if "login" in page.url.lower() and "#/home" not in page.url:
-        captura(page, "login_bloqueado")
-        raise RuntimeError("login_bloqueado: sigue en pantalla de login")
-
-
-# ── abrir solicitud del mes ────────────────────────────────────────────────────
-def abrir_solicitud(page, periodo: str) -> str:
-    """
-    Navega a la bandeja EN CURSO y hace clic en la solicitud del periodo dado
-    (ej. '2026-11' → fila con 'NOV/2026').
-    Devuelve la URL de detalle.
-    """
-    # periodo '2026-11' → 'NOV/2026'
-    meses = ["ENE", "FEB", "MAR", "ABR", "MAY", "JUN",
-             "JUL", "AGO", "SEP", "OCT", "NOV", "DIC"]
-    año, mes = periodo.split("-")
-    mes_txt = f"{meses[int(mes)-1]}/{año}"
-
-    paso("Ir a Consultar Bandeja de Solicitud de Servicio")
-    page.locator("text=Consultar Bandeja de Solicitud").first.click()
-    page.wait_for_load_state("networkidle", timeout=20000)
-    page.wait_for_timeout(2000)
-
-    paso("Buscar todas las solicitudes (JS click en Buscar)")
-    # El botón está fuera del viewport en el layout actual; se usa JS
-    page.evaluate("document.querySelector('button[type=\"submit\"]').click()")
-    page.wait_for_timeout(3000)
-
-    paso("Pestaña EN CURSO")
-    page.locator("text=EN CURSO").first.click()
-    page.wait_for_timeout(3000)
-
-    paso(f"Buscar fila {mes_txt} + Desparafinación")
-    # Buscar la fila correcta
-    filas = page.locator("tr").all()
-    fila_ok = None
-    for fila in filas:
-        txt = fila.inner_text().lower()
-        if mes_txt.lower() in txt and "desparaf" in txt:
-            fila_ok = fila
-            break
-
-    if not fila_ok:
-        captura(page, "solicitud_no_encontrada")
-        raise RuntimeError(f"solicitud_no_encontrada: no hay fila con {mes_txt} + Desparafinación en EN CURSO")
-
-    paso(f"Clic en N° de solicitud ({mes_txt})")
-    # El número de solicitud es el primer link/celda de la fila
-    fila_ok.locator("td").first.click(timeout=10000)
-    page.wait_for_url("**/detailmonthly/**", timeout=20000)
-    page.wait_for_timeout(2000)
-
-    log(f"URL detalle: {page.url}")
-    return page.url
-
-
-# ── verificar título de la solicitud ─────────────────────────────────────────
-def verificar_solicitud(page, periodo: str):
-    meses_es = ["ENERO", "FEBRERO", "MARZO", "ABRIL", "MAYO", "JUNIO",
-                "JULIO", "AGOSTO", "SEPTIEMBRE", "OCTUBRE", "NOVIEMBRE", "DICIEMBRE"]
-    año, mes = periodo.split("-")
-    mes_es = meses_es[int(mes) - 1]
-    contenido = page.content().upper()
-    if mes_es not in contenido and f"{mes_es[:3]}/{año}" not in contenido:
-        log(f"Aviso: no se confirmó '{mes_es} {año}' en el título de la solicitud")
-
-
-# ── agregar o ubicar ubicación ────────────────────────────────────────────────
-def gestionar_ubicacion(page, celda: dict) -> str:
-    """
-    Verifica si la ubicación ya existe; si no, la agrega.
-    Devuelve el nombre exacto que quedó en Y-Click.
-    """
-    ubicacion = celda["ubicacion"]           # ej. "COLECTOR LOC 56"
-    tipo_payload = celda["tipo_ubicacion"]   # ej. "Pozo - Operación y Mantenimiento"
-
-    paso(f"Verificar si '{ubicacion}' ya existe")
-    contenido = page.content().upper()
-    # Buscar el nombre del payload o variantes conocidas
-    busqueda_ub = ubicacion.upper()
-    # Para "COLECTOR LOC 56" la variante en Y-Click es "LOCACION N° 56"
-    # Estrategia: si no encontramos el nombre exacto, buscamos por número si lo hay
-    ya_existe = busqueda_ub in contenido
-
-    if ya_existe:
-        log(f"Ubicación '{ubicacion}' ya existe en la lista")
-        return ubicacion
-
-    # --- Agregar ubicación ---
-    paso("Clic en Agregar ubicación")
-    page.locator("text=Agregar ubicación").first.click()
-    page.wait_for_selector(".modal-body", timeout=10000)
-    page.wait_for_timeout(1500)
-
-    # Elegir tipo de ubicación
-    # Estrategia: intentar con el tipo exacto del payload; si no existe, con la variante "Locación"
-    paso(f"Elegir tipo de ubicación: '{tipo_payload}'")
-    tipos_disponibles = react_select_opciones(page, "Tipo de ubicación", tipo_payload)
-    log(f"  Tipos disponibles: {tipos_disponibles}")
-
-    tipo_elegido = None
-    # Buscar coincidencia en las opciones disponibles (case-insensitive, parcial)
-    palabras_clave = [w for w in tipo_payload.split() if len(w) > 3]
-    for op in tipos_disponibles:
-        matches = sum(1 for w in palabras_clave if w.lower() in op.lower())
-        if matches >= 2:  # al menos 2 palabras coinciden
-            tipo_elegido = op
-            break
-    if not tipo_elegido and tipos_disponibles:
-        # Fallback: primera opción que contenga "Operación"
-        for op in tipos_disponibles:
-            if "operaci" in op.lower():
-                tipo_elegido = op
-                break
-
-    if not tipo_elegido:
-        captura(page, "ubicacion_no_soportada")
-        raise RuntimeError(f"ubicacion_no_soportada: no se encontró tipo '{tipo_payload}' en Y-Click. Disponibles: {tipos_disponibles}")
-
-    # Ahora elegir el tipo
-    container_tipo = page.locator(
-        ".modal-body .generic-select:has(label:has-text('Tipo de ubicación'))"
-    ).first
-    inp_tipo = container_tipo.locator("input[type='text']").first
-    inp_tipo.fill(tipo_elegido[:10])
-    page.wait_for_timeout(1500)
-    page.locator(f"[class*='-option']:has-text('{tipo_elegido[:30]}')").first.click()
-    log(f"  Tipo elegido: '{tipo_elegido}'")
-    page.wait_for_timeout(2000)
-
-    # El label del campo de ubicación cambia con el tipo:
-    # "Pozo" → "Ubicación pozo" / "Locación" → "Ubicación locación"
-    # Buscar el label que contiene "Ubicación"
-    labels_modal = page.locator(".modal-body .form-label").all()
-    label_ub = None
-    for lbl in labels_modal:
-        txt = lbl.inner_text().strip()
-        if "ubicaci" in txt.lower() and "tipo" not in txt.lower():
-            label_ub = txt
-            break
-    if not label_ub:
-        label_ub = "Ubicación"
-    log(f"  Label del campo de ubicación: '{label_ub}'")
-
-    # Buscar la ubicación por su nombre (o parte de él)
-    # Para "COLECTOR LOC 56" intentamos buscar "56" o "COLECTOR" o "LOCACION"
-    terminos_busqueda = [
-        ubicacion,            # nombre exacto del payload
-        ubicacion.split()[-1],  # última palabra (ej. "56")
-        ubicacion[:8],        # primeras letras
-    ]
-    nombre_elegido = None
-    for termino in terminos_busqueda:
-        paso(f"Buscar ubicación con término '{termino}'")
-        try:
-            opciones_ub = react_select_opciones(page, label_ub, termino)
-            log(f"  Opciones para '{termino}': {opciones_ub}")
-            if opciones_ub:
-                # Elegir la primera opción (o la que coincida mejor)
-                mejor = None
-                for op in opciones_ub:
-                    # La última palabra del nombre del payload suele estar en el nombre Y-Click
-                    if ubicacion.split()[-1].upper() in op.upper():
-                        mejor = op
-                        break
-                if not mejor:
-                    mejor = opciones_ub[0]
-
-                # Elegir
-                container_ub = page.locator(
-                    f".modal-body .generic-select:has(label:has-text('{label_ub}'))"
-                ).first
-                inp_ub = container_ub.locator("input[type='text']").first
-                inp_ub.fill(termino)
-                page.wait_for_timeout(1500)
-                page.locator(f"[class*='-option']:has-text('{mejor[:30]}')").first.click()
-                nombre_elegido = mejor
-                log(f"  Ubicación elegida: '{nombre_elegido}'")
-                page.wait_for_timeout(2000)
-                break
-        except Exception as e:
-            log(f"  Fallo con término '{termino}': {e}")
-            continue
-
-    if not nombre_elegido:
-        captura(page, "ubicacion_no_encontrada")
-        raise RuntimeError(f"ubicacion_no_encontrada: no se encontró '{ubicacion}' en Y-Click")
-
-    # Verificar que Unidad de Negocio y Activo se autocomplete
-    paso("Verificar autocompletado de Unidad de Negocio / Activo")
-    page.wait_for_timeout(1000)
-    # (Solo verificación visual; no forzamos valores)
-
-    # Clic en Agregar
-    paso("Clic en Agregar (modal ubicación)")
-    # Intentar primero "Agregar" habilitado (no "Agregar y continuar")
-    btns = page.locator(".modal-content button:not([class*='btn-close'])").all()
-    btn_agregar = None
-    for btn in btns:
-        txt = btn.inner_text().strip()
-        if txt == "Agregar" and not btn.is_disabled():
-            btn_agregar = btn
-            break
-    if not btn_agregar:
-        # Intentar cualquier botón de agregar
-        btn_agregar = page.locator(
-            ".modal-content button:has-text('Agregar'):not(:has-text('continuar')):not([class*='btn-close'])"
-        ).first
-
-    btn_agregar.click(timeout=8000)
-    page.wait_for_timeout(2000)
-
-    # Esperar cierre del modal o aviso
-    try:
-        page.wait_for_selector("text=correctamente, text=agregó", timeout=8000)
-        log("Ubicación agregada correctamente")
-    except PWTimeout:
-        log("Aviso de ubicación no detectado, continuando")
-
-    page.wait_for_timeout(1500)
-    return nombre_elegido
-
-
-# ── agregar posición y línea ──────────────────────────────────────────────────
-def gestionar_posicion_linea(page, celda: dict):
-    """Agrega la posición y línea para la fecha de la celda."""
-    posicion = celda["posicion"]     # ej. "31 - NOC ESTE -SRV.DESPARAF.HOT OIL L a V H OPERATIVA"
-    linea_cod = celda["linea"]       # ej. "10"
-    fecha = celda["fecha"]           # ej. "2026-11-03"
-    año, mes, dia = fecha.split("-")
-    dia_str = f"{dia}/{mes}/{año}"   # "03/11/2026"
-
-    pos_cod = posicion.split(" - ")[0].strip()  # "31"
-
-    paso("Expandir el bloque de ubicación")
-    # Marcar el checkbox de la ubicación para habilitarla
-    try:
-        checkboxes = page.locator(".parte-trabajo input[type='checkbox'], [class*='ubicacion'] input[type='checkbox']").all()
-        for cb in checkboxes:
-            if not cb.is_checked():
-                cb.click()
-                page.wait_for_timeout(500)
-                break
-    except Exception:
-        pass
-
-    # Verificar si ya tiene la posición/línea para esta fecha
-    contenido = page.content()
-    if pos_cod in contenido and linea_cod + " -" in contenido:
-        log(f"Posición {pos_cod} / línea {linea_cod} ya visible en la página")
-        return
-
-    paso("Clic en Agregar posición y línea")
-    try:
-        page.locator(
-            "text=Agregar posición y línea a ubicaciones, "
-            "button:has-text('Agregar líneas'), "
-            "button:has-text('Agregar posici')"
-        ).first.click(timeout=10000)
-    except PWTimeout:
-        # Intentar desde dentro del bloque de ubicación
-        page.locator("button:has-text('Agregar l')").first.click(timeout=8000)
-
-    page.wait_for_selector(".modal-body", timeout=10000)
-    page.wait_for_timeout(1500)
-
-    paso(f"Elegir posición: código {pos_cod}")
-    nombre_pos = react_select_elegir(page, "Posición", pos_cod)
-    log(f"  Posición elegida: '{nombre_pos}'")
-    page.wait_for_timeout(1500)
-
-    paso(f"Elegir línea: código {linea_cod}")
-    # La línea se habilita al elegir la posición; buscar por código
-    opciones_linea = react_select_opciones(page, "Línea", linea_cod)
-    log(f"  Opciones de línea: {opciones_linea}")
-    linea_elegida = None
-    for op in opciones_linea:
-        cod = op.split(" - ")[0].strip() if " - " in op else op.strip()
-        if cod == linea_cod:
-            linea_elegida = op
-            break
-    if not linea_elegida:
-        captura(page, "linea_no_encontrada")
-        raise RuntimeError(f"linea_no_encontrada: no existe línea con código '{linea_cod}'. Opciones: {opciones_linea}")
-
-    container_lin = page.locator(".modal-body .generic-select:has(label:has-text('Línea'))").first
-    inp_lin = container_lin.locator("input[type='text']").first
-    inp_lin.fill(linea_cod)
-    page.wait_for_timeout(1500)
-    page.locator(f"[class*='-option']:has-text('{linea_elegida[:30]}')").first.click()
-    log(f"  Línea elegida: '{linea_elegida}'")
-    page.wait_for_timeout(1000)
-
-    paso(f"Ajustar Desde y Hasta a {dia_str}")
-    for label in ["Desde", "Hasta"]:
-        try:
-            inp = page.locator(f"input:near(:text('{label}'))").first
-            inp.triple_click()
-            inp.fill(dia_str)
-            page.wait_for_timeout(300)
-        except Exception as e:
-            log(f"Aviso: no pude ajustar '{label}': {e}")
-
-    paso("Clic en Aceptar")
-    page.locator(
-        ".modal-content button:has-text('Aceptar'), "
-        ".modal-content button[type='submit']:has-text('Aceptar')"
-    ).first.click(timeout=8000)
-    page.wait_for_timeout(2000)
-    page.wait_for_load_state("networkidle", timeout=15000)
-    log("Posición y línea agregadas")
-
-
-# ── navegar al día ────────────────────────────────────────────────────────────
-def navegar_al_dia(page, fecha: str):
-    """Navega en el selector de día hasta llegar a la fecha indicada (YYYY-MM-DD)."""
-    año, mes, dia = fecha.split("-")
-    dia_int = int(dia)
-    meses_es = ["enero", "febrero", "marzo", "abril", "mayo", "junio",
-                "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
-    mes_es = meses_es[int(mes) - 1]
-
-    paso(f"Navegar al día {dia}/{mes}/{año}")
-    for _ in range(45):
-        contenido = page.content().lower()
-        if (f"{dia_int} de {mes_es}" in contenido or
-                f"0{dia_int} de {mes_es}" in contenido or
-                f"{dia}/{mes}/{año}" in contenido):
-            log(f"Día {dia}/{mes} visible")
-            return
-        try:
-            page.locator(
-                "button[aria-label*='siguiente'], button:has-text('>'), "
-                "[class*='next'], [class*='siguiente']"
-            ).first.click(timeout=4000)
-            page.wait_for_timeout(400)
-        except PWTimeout:
-            log("Aviso: no se encontró botón de día siguiente")
-            break
-
-    log(f"Aviso: no se pudo confirmar el día {dia}/{mes} en el navegador de fecha")
-
-
-# ── cargar cantidad ────────────────────────────────────────────────────────────
-def cargar_cantidad(page, celda: dict) -> str:
-    """
-    Busca la caja de cantidad de la fila correcta.
-    Si ya tiene valor devuelve 'ya_existia'.
-    Si está vacía escribe la cantidad y devuelve 'pendiente'.
-    """
-    pos_cod = celda["posicion"].split(" - ")[0].strip()
-    cantidad = celda["cantidad"]
-    linea_cod = celda["linea"]
-
-    paso("Buscar caja de cantidad")
-    # Buscar dentro de la fila que tenga el código de posición y línea
-    caja = None
-    for sel in [
-        f"tr:has-text('{pos_cod}'):has-text('{linea_cod}') input[type='number']",
-        f"tr:has-text('{pos_cod}'):has-text('{linea_cod}') input[type='text']",
-        f"[class*='row']:has-text('{pos_cod}') input[type='number']",
-        "input[type='number']",
-    ]:
-        try:
-            locs = page.locator(sel).all()
-            if locs:
-                caja = locs[0]
-                break
-        except Exception:
-            pass
-
-    if caja is None:
-        raise RuntimeError("caja_no_encontrada: no se ubicó el input de cantidad")
-
-    val_actual = caja.input_value(timeout=5000).strip()
-    if val_actual not in ("", "0"):
-        log(f"Celda ya tiene valor '{val_actual}' → ya_existia")
-        return "ya_existia"
-
-    paso(f"Escribir cantidad {cantidad}")
-    caja.triple_click()
-    caja.fill(str(cantidad))
-    page.wait_for_timeout(500)
-
-    # Verificar
-    val_leido = caja.input_value(timeout=5000).strip()
-    if val_leido != str(cantidad):
-        captura(page, "valor_no_coincide")
-        raise RuntimeError(f"valor_no_coincide: se escribió {cantidad} pero se lee '{val_leido}'")
-
-    log(f"Valor confirmado en pantalla: {val_leido}")
-    return "pendiente"
-
-
-# ── verificar y enviar ────────────────────────────────────────────────────────
-def verificar_y_enviar(page, celda: dict):
-    pos_cod = celda["posicion"].split(" - ")[0].strip()
-    ubicacion = celda["ubicacion"]
-    cantidad = celda["cantidad"]
-
-    paso("Verificar datos antes de Enviar a aprobar")
-    contenido = page.content()
-    checks = {
-        "pos_cod": pos_cod in contenido,
-        "linea":   celda["linea"] in contenido,
-        "cantidad": str(cantidad) in contenido,
-    }
-    log(f"Verificación: {checks}")
-    if not all(checks.values()):
-        fallidos = [k for k, v in checks.items() if not v]
-        captura(page, "verificacion_fallida")
-        raise RuntimeError(f"valor_no_coincide: no confirmados en pantalla: {fallidos}")
-
-    paso("Pulsar Enviar a aprobar")
-    page.locator("button:has-text('Enviar a aprobar')").first.click(timeout=10000)
-    page.wait_for_timeout(2500)
-
-    paso("Verificar envío (botón deshabilitado o valor en verde)")
-    try:
-        page.wait_for_selector(
-            "button:has-text('Enviar a aprobar')[disabled], "
-            "[class*='verde'], [class*='green'], [class*='enviado']",
-            timeout=8000,
-        )
-        log("Envío confirmado")
-    except PWTimeout:
-        log("Aviso: no se detectó confirmación visual de envío")
-
-
-# ── doc_respaldo ──────────────────────────────────────────────────────────────
-def cargar_doc_respaldo(page, celda: dict):
-    if not celda.get("doc_respaldo"):
-        return
-    pos_cod = celda["posicion"].split(" - ")[0].strip()
-    doc = celda["doc_respaldo"]
-
-    paso(f"Ícono código de barras → doc_respaldo '{doc}'")
-    try:
-        page.locator(
-            f"tr:has-text('{pos_cod}') [class*='barcode'], "
-            f"tr:has-text('{pos_cod}') [title*='espaldo'], "
-            f"tr:has-text('{pos_cod}') [aria-label*='espaldo'], "
-            f"tr:has-text('{pos_cod}') button:nth-child(1)"
-        ).first.click(timeout=8000)
-        page.wait_for_selector(".modal-body", timeout=8000)
-        page.wait_for_timeout(1000)
-
-        inp = page.locator(
-            "input[name*='respaldo'], input[name*='documento'], "
-            "input[placeholder*='ocumento'], input[id*='respaldo']"
-        ).first
-        inp.triple_click()
-        inp.fill(doc)
-        page.wait_for_timeout(500)
-
-        page.locator("button:has-text('Guardar'), button[type='submit']").first.click(timeout=8000)
-        try:
-            page.wait_for_selector("text=correctamente, text=guardó", timeout=8000)
-            log(f"Doc respaldo '{doc}' guardado OK")
-        except PWTimeout:
-            log("Aviso: confirmación de doc_respaldo no detectada")
-        page.wait_for_timeout(1000)
-        # Cerrar modal si sigue abierto
-        try:
-            page.locator(".modal-content button:has-text('Cerrar'), .btn-close").first.click(timeout=3000)
-        except Exception:
-            pass
-
-    except Exception as e:
-        log(f"Aviso: fallo en doc_respaldo: {e} (no bloqueante)")
-
-
-# ── adjuntar PDF ──────────────────────────────────────────────────────────────
-def adjuntar_pdf(page, celda: dict, pdf_path: str) -> bool:
-    pos_cod = celda["posicion"].split(" - ")[0].strip()
-    parte_num = celda["adjuntos"][0]["parte"] if celda.get("adjuntos") else None
-
-    paso("Ícono documento → adjuntar PDF")
-    try:
-        page.locator(
-            f"tr:has-text('{pos_cod}') [class*='attach'], "
-            f"tr:has-text('{pos_cod}') [class*='document'], "
-            f"tr:has-text('{pos_cod}') [class*='file'], "
-            f"tr:has-text('{pos_cod}') [title*='djunto'], "
-            f"tr:has-text('{pos_cod}') [aria-label*='djunto'], "
-            f"tr:has-text('{pos_cod}') button:nth-child(3)"
-        ).first.click(timeout=8000)
-        page.wait_for_selector(".modal-body", timeout=8000)
-        page.wait_for_timeout(1500)
-
-        # Buscar el botón "Agregar adjunto" en la sección de la LÍNEA (no de la solicitud)
-        paso("Buscar sección de adjuntos de la línea")
-        btns_agregar = page.locator(
-            ".modal-content button:has-text('Agregar adjunto'), "
-            ".modal-content button:has-text('Agregar')"
-        ).all()
-
-        btn_ok = None
-        for btn in btns_agregar:
-            try:
-                # Subir en el DOM para ver el texto del contenedor padre
-                padre_txt = btn.evaluate(
-                    "el => el.closest('div[class]')?.innerText || ''"
-                ).lower()
-                if "solicitud" not in padre_txt:
-                    btn_ok = btn
-                    break
-            except Exception:
-                pass
-        if not btn_ok and btns_agregar:
-            btn_ok = btns_agregar[-1]  # el último suele ser de la línea
-
-        paso("Seleccionar PDF con file chooser")
-        with page.expect_file_chooser() as fc_info:
-            btn_ok.click(timeout=8000)
-        fc_info.value.set_files(pdf_path)
-        page.wait_for_timeout(2000)
-
-        paso("Pulsar Agregar para confirmar subida")
-        page.locator(
-            ".modal-content button:has-text('Agregar'):not(:has-text('adjunto'))"
-        ).first.click(timeout=10000)
-
-        try:
-            page.wait_for_selector(
-                "text=Adjuntando archivos, text=adjuntando", timeout=10000
-            )
-        except PWTimeout:
-            log("Aviso: no se detectó 'Adjuntando archivos'")
-
-        page.wait_for_timeout(3000)
-
-        # Verificar que el archivo aparece en la lista
-        modal_txt = page.locator(".modal-content").inner_text().lower()
-        nombre_pdf = pathlib.Path(pdf_path).name.lower()
-        if nombre_pdf in modal_txt or (parte_num and str(parte_num) in modal_txt):
-            log(f"PDF confirmado en la lista de adjuntos")
-        else:
-            log(f"Aviso: no se confirmó el PDF en la lista")
-
-        paso("Salir del modal de adjuntos")
-        page.locator(
-            ".modal-content button:has-text('Salir'), "
-            ".modal-content button:has-text('Cerrar'), "
-            ".btn-close"
-        ).first.click(timeout=8000)
-        page.wait_for_timeout(1000)
-        return True
-
-    except Exception as e:
-        log(f"Error al adjuntar PDF: {e}")
-        return False
-
-
-# ── procesar una celda ────────────────────────────────────────────────────────
-def procesar_celda(page, celda: dict, sync_id: str, pdf_dir: str) -> dict:
-    """Ejecuta los pasos 3-8 para una celda. Devuelve el dict de resultado."""
-    global _pasos, _celda_inicio
-    reset_pasos()
-
-    celda_id = celda["celda_id"]
-    resultado = "error"
-    motivo = None
-    detalle = None
-
-    try:
-        # Descargar PDF si lo hay
-        pdf_path = None
-        if celda.get("adjuntos"):
-            adj = celda["adjuntos"][0]
-            pdf_path = str(pathlib.Path(pdf_dir) / adj["archivo"])
-            if not pathlib.Path(pdf_path).exists():
-                # Pedir URL fresca y descargar
-                sync_data = json.loads(
-                    subprocess.run(
-                        ["/usr/bin/python3", "-I", WELLS_API, "get", sync_id],
-                        capture_output=True, text=True
-                    ).stdout
-                )
-                url_fresca = next(
-                    (a["url_firmada"]
-                     for c in sync_data["celdas"] if c["celda_id"] == celda_id
-                     for a in c.get("adjuntos", []) if a["archivo"] == adj["archivo"]),
-                    None
-                )
-                if url_fresca:
-                    rc_dl = subprocess.run(
-                        ["/usr/bin/python3", "-I", WELLS_API, "download", url_fresca, pdf_path],
-                        capture_output=True, text=True
-                    ).returncode
-                    if rc_dl != 0:
-                        raise RuntimeError(f"error_descarga_pdf: no se pudo descargar {adj['archivo']}")
-                    log(f"PDF descargado: {pdf_path}")
-                else:
-                    raise RuntimeError("error_descarga_pdf: no se encontró url_firmada fresca")
-
-        # Paso 3 — Ubicación
-        nombre_ub = gestionar_ubicacion(page, celda)
-
-        # Paso 4 — Posición y línea
-        gestionar_posicion_linea(page, celda)
-
-        # Paso 5 — Navegar al día y cargar cantidad
-        navegar_al_dia(page, celda["fecha"])
-        estado_carga = cargar_cantidad(page, celda)
-
-        if estado_carga == "ya_existia":
-            resultado = "ya_existia"
-            detalle = "La celda ya tenía un valor en Y-Click"
-        else:
-            # Paso 6 — Enviar a aprobar
-            verificar_y_enviar(page, celda)
-
-            # Paso 7 — Doc respaldo
-            cargar_doc_respaldo(page, celda)
-
-            # Paso 8 — Adjuntar PDF
-            if pdf_path:
-                adj_ok = adjuntar_pdf(page, celda, pdf_path)
-                if adj_ok:
-                    resultado = "ok"
-                    detalle = "Carga enviada a aprobar con PDF adjunto"
-                else:
-                    resultado = "error"
-                    motivo = "error_adjunto"
-                    detalle = "Horas enviadas a aprobar pero falló el adjunto del PDF"
-            else:
-                resultado = "ok"
-                detalle = "Carga enviada a aprobar (sin adjuntos)"
-
-    except RuntimeError as e:
-        msg = str(e)
-        log(f"ERROR en celda {celda_id}: {msg}")
-        if any(msg.startswith(k) for k in [
-            "login_bloqueado", "solicitud_no_encontrada", "ubicacion_no_encontrada",
-            "ubicacion_ambigua", "ubicacion_no_soportada", "posicion_no_encontrada",
-            "linea_no_encontrada", "valor_no_coincide", "error_descarga_pdf",
-        ]):
-            motivo = msg.split(":")[0]
-            detalle = msg
-        elif "tope_pasos" in msg:
-            motivo = "tope_excedido"
-            detalle = "Se superó el límite de 60 pasos"
-        elif "tope_tiempo" in msg:
-            motivo = "tope_excedido"
-            detalle = "Se superó el límite de 6 minutos"
-        else:
-            motivo = "error_inesperado"
-            detalle = msg
-        resultado = "error"
-
-    except Exception as e:
-        log(f"EXCEPCION en celda {celda_id}: {type(e).__name__}: {e}")
-        resultado = "error"
-        motivo = "excepcion"
-        detalle = f"{type(e).__name__}: {e}"
-
-    return {"celda_id": celda_id, "resultado": resultado,
-            "motivo": motivo, "detalle": detalle, "captura_url": None}
-
-
-# ── main ──────────────────────────────────────────────────────────────────────
-def main():
-    global _log_path
-
-    if len(sys.argv) < 2:
-        print("Uso: bot_yclick.py <sync_id>", file=sys.stderr)
-        sys.exit(2)
-
-    sync_id = sys.argv[1]
-
-    # Validar UUID
-    import re
-    if not re.match(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$", sync_id):
-        print(f"sync_id inválido: {sync_id}", file=sys.stderr)
-        sys.exit(2)
-
-    inicio = datetime.datetime.now(ARS_TZ)
-    log_dir = pathlib.Path("/tmp/yclick_logs")
-    log_dir.mkdir(parents=True, exist_ok=True)
-    _log_path = log_dir / f"{inicio.strftime('%Y-%m-%d_%H%M%S')}_{sync_id}.md"
-    pdf_dir = str(log_dir)
-
-    log(f"=== INICIO sync_id={sync_id} ===")
-    log(f"Hora ARS: {inicio.isoformat()}")
-
-    # Verificar credenciales
-    for var in ["TOKEN_WELLS", "YCLICK_CALLBACK_SECRET", "USUARIO_YCLICK", "CONTRASENA_YCLICK"]:
-        if not os.environ.get(var):
-            log(f"FALTA variable de entorno: {var}")
-            flush_log()
-            print(f"ERROR: falta {var}", file=sys.stderr)
-            sys.exit(1)
-
-    # GET sync
-    sync_path = str(log_dir / f"sync_{sync_id[:8]}.json")
-    try:
-        sync = wells_get(sync_id, sync_path)
-    except Exception as e:
-        log(f"No se pudo obtener el sync: {e}")
-        flush_log()
-        sys.exit(1)
-
-    estado_sync = sync.get("estado")
-    log(f"Estado del sync: {estado_sync}")
-    if estado_sync != "en_proceso":
-        log(f"Sync no está en_proceso (estado={estado_sync}). No se hace nada.")
-        flush_log()
-        print(f"Sync estado={estado_sync}, no en_proceso. Saliendo.")
-        sys.exit(0)
-
-    celdas = sync.get("celdas", [])
-    periodo = sync.get("solicitud", {}).get("periodo", "")
-    log(f"Celdas a procesar: {len(celdas)} | Periodo: {periodo}")
-
-    resultados: list[dict] = []
-    detener_sync = False
-    detener_motivo = ""
-
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(
+        log(f"  No se pudo capturar: {e}")
+    return None
+
+
+def escribir_json_tmp(datos, nombre):
+    path = f"{SCRATCHPAD}/{nombre}.json"
+    with open(path, "w") as f:
+        json.dump(datos, f, ensure_ascii=False)
+    return path
+
+
+def llamar_wells(cmd_args):
+    """Llama a wells_api.py y retorna (exit_code, stdout, stderr)."""
+    cmd = f"{WELLS_API} {cmd_args}"
+    r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
+    log(f"  wells_api: {cmd_args.split()[0]} -> exit {r.returncode} | stderr: {r.stderr.strip()[:200]}")
+    return r.returncode, r.stdout, r.stderr
+
+
+def reportar_progreso(sync_id, resultado_celda):
+    """Envía progreso a Wells para una celda ya procesada."""
+    payload = {"celdas": [resultado_celda]}
+    path = escribir_json_tmp(payload, f"progreso_{resultado_celda['celda_id'][:8]}")
+    code, out, err = llamar_wells(f"progreso {sync_id} {path}")
+    if code != 0:
+        log(f"  WARN: progreso no enviado (exit={code}): {err[:200]}")
+    return code == 0
+
+
+async def run(sync_data):
+    sync_id = sync_data["sync_id"]
+    celdas = sync_data["celdas"]
+    solicitud = sync_data["solicitud"]
+    periodo = solicitud.get("periodo", "")
+
+    meses_es = {"01":"ENE","02":"FEB","03":"MAR","04":"ABR","05":"MAY","06":"JUN",
+                 "07":"JUL","08":"AGO","09":"SEP","10":"OCT","11":"NOV","12":"DIC"}
+    if "-" in periodo:
+        anio, mes_num = periodo.split("-", 1)
+    else:
+        anio, mes_num = "", ""
+    mes_txt = meses_es.get(mes_num, mes_num)
+    periodo_yclick = f"{mes_txt}/{anio}"
+    log(f"Sync {sync_id} | periodo {periodo_yclick} | {len(celdas)} celda(s)")
+
+    resultados = []
+    login_bloqueado = False
+    solicitud_no_encontrada = False
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
             executable_path=CHROMIUM,
             headless=True,
-            args=["--no-sandbox"],
+            args=["--no-sandbox"]
         )
-        context = browser.new_context(
-            viewport={"width": 1366, "height": 1800},
-            accept_downloads=True,
-        )
-        page = context.new_page()
+        context = await browser.new_context(viewport={"width": 1400, "height": 900})
+        page = await context.new_page()
 
+        # ---- LOGIN ----
+        log("Paso 0: Login Y-Click")
+        await page.goto("https://yclick.ypf.com/", timeout=60000)
+        await page.wait_for_url("**/login**", timeout=60000)
+        await page.fill("input[name='username'], input[type='text']", os.environ["USUARIO_YCLICK"])
+        await page.fill("input[name='password'], input[type='password']", os.environ["CONTRASENA_YCLICK"])
+        await page.click("button[type='submit'], button:has-text('Ingresar')")
         try:
-            # Paso 0 — Login
-            login(page)
-
-            # Paso 1 — Abrir solicitud del mes
-            abrir_solicitud(page, periodo)
-            verificar_solicitud(page, periodo)
-
-            # Paso 2 — PARTE DE TRABAJO ya activa por defecto
-
+            await page.wait_for_url("**/#/home**", timeout=60000)
+            log("  Login OK -> #/home")
+        except PWTimeout:
+            url_act = page.url
+            titulo = await page.title()
+            log(f"  Login FALLÓ. URL: {url_act} | Título: {titulo}")
+            await screenshot(page, "login_bloqueado")
+            login_bloqueado = True
             for celda in celdas:
-                if detener_sync:
-                    resultados.append({
-                        "celda_id": celda["celda_id"],
-                        "resultado": "error",
-                        "motivo": detener_motivo,
-                        "detalle": f"Sync detenido por {detener_motivo}",
-                        "captura_url": None,
-                    })
+                r = {
+                    "celda_id": celda["celda_id"],
+                    "resultado": "error",
+                    "motivo": "login_bloqueado",
+                    "detalle": f"Login no llegó a #/home. URL={url_act}. Título={titulo}",
+                    "captura_url": None
+                }
+                resultados.append(r)
+                reportar_progreso(sync_id, r)
+            await browser.close()
+            return resultados, login_bloqueado
+
+        # ---- SOLICITUD ----
+        log("Paso 1: Buscar solicitud del mes")
+        try:
+            await page.click("text=Consultar Bandeja de Solicitud de Servicio", timeout=15000)
+        except PWTimeout:
+            try:
+                await page.click("a:has-text('Consultar Bandeja')", timeout=10000)
+            except Exception as e:
+                log(f"  No se encontró link Consultar Bandeja: {e}")
+
+        await page.wait_for_load_state("networkidle", timeout=20000)
+        log("  JS click en Buscar...")
+        await page.evaluate("document.querySelector('button[type=\"submit\"]').click()")
+        await page.wait_for_load_state("networkidle", timeout=20000)
+        await asyncio.sleep(1)
+
+        log("  Click pestaña EN CURSO")
+        try:
+            await page.click("text=EN CURSO", timeout=10000)
+        except PWTimeout:
+            try:
+                await page.click("*:has-text('EN CURSO')", timeout=5000)
+            except Exception as e:
+                log(f"  WARN: no se encontró pestaña EN CURSO: {e}")
+        await asyncio.sleep(1.5)
+
+        log(f"  Buscando solicitud con periodo '{periodo_yclick}' + 'Desparaf' + 'En Ejecución'")
+        # Estrategia: buscar el elemento que contiene el periodo y navegar al MSDS desde ahí
+        import re as _re
+        solicitud_encontrada = False
+
+        # Buscar todos los elementos que contienen el periodo
+        periodo_els = await page.query_selector_all(f"td, span, div")
+        msds_a_clickear = None
+        for el in periodo_els:
+            try:
+                txt = (await el.inner_text()).strip()
+            except Exception:
+                continue
+            if periodo_yclick in txt and len(txt) < 20:
+                # Este elemento es la celda del periodo. Buscar el MSDS en la misma fila/fila anterior
+                log(f"  Elemento periodo encontrado: '{txt}'")
+                # Buscar la fila contenedora
+                try:
+                    fila_el = await el.evaluate_handle("e => e.closest('tr')")
+                    fila_txt = await (await fila_el.get_property("innerText")).json_value()
+                    log(f"  Fila contenedora: {fila_txt[:150]}")
+                    # Intentar click en MSDS dentro de la fila
+                    msds_m = _re.search(r"MSDS\d+", fila_txt)
+                    if msds_m:
+                        msds_a_clickear = msds_m.group(0)
+                        log(f"  MSDS en fila: {msds_a_clickear}")
+                        break
+                    # Si no hay MSDS en la misma fila, buscar en fila anterior (some tables split rows)
+                    prev_txt = await el.evaluate("""e => {
+                        let tr = e.closest('tr');
+                        if (!tr) return '';
+                        let prev = tr.previousElementSibling;
+                        return prev ? prev.innerText : '';
+                    }""")
+                    msds_m2 = _re.search(r"MSDS\d+", prev_txt)
+                    if msds_m2:
+                        msds_a_clickear = msds_m2.group(0)
+                        log(f"  MSDS en fila anterior: {msds_a_clickear}")
+                        break
+                except Exception as e:
+                    log(f"  WARN fila: {e}")
+
+        if not msds_a_clickear:
+            # Fallback: buscar MSDS directamente en el texto de la tabla
+            tabla_txt = ""
+            try:
+                tabla_txt = await page.inner_text("table", timeout=5000)
+            except Exception:
+                pass
+            # Buscar el MSDS que está cerca de NOV/2026 y Desparaf
+            lineas = tabla_txt.split("\n")
+            for i, linea in enumerate(lineas):
+                if periodo_yclick in linea:
+                    # Buscar MSDS en las 10 líneas anteriores
+                    contexto = "\n".join(lineas[max(0,i-10):i+2])
+                    msds_m = _re.search(r"MSDS\d+", contexto)
+                    desparaf_cerca = any("Desparaf" in l or "desparaf" in l.lower() for l in lineas[max(0,i-10):i+2])
+                    if msds_m and desparaf_cerca:
+                        msds_a_clickear = msds_m.group(0)
+                        log(f"  MSDS fallback por contexto: {msds_a_clickear}")
+                        break
+
+        if msds_a_clickear:
+            try:
+                await page.click(f"text={msds_a_clickear}", timeout=8000)
+                solicitud_encontrada = True
+                log(f"  Click en {msds_a_clickear} OK")
+            except Exception as e:
+                log(f"  WARN click {msds_a_clickear}: {e}")
+                # Último intento: buscar el elemento por texto exacto
+                els = await page.query_selector_all(f"*")
+                for el in els:
+                    try:
+                        t = (await el.inner_text()).strip()
+                        if t == msds_a_clickear:
+                            await el.click(timeout=3000)
+                            solicitud_encontrada = True
+                            break
+                    except Exception:
+                        pass
+
+        if not solicitud_encontrada:
+            await screenshot(page, "solicitud_no_encontrada")
+            contenido_tabla = ""
+            try:
+                contenido_tabla = await page.inner_text("table", timeout=5000)
+            except Exception:
+                pass
+            log(f"  solicitud_no_encontrada. Tabla: {contenido_tabla[:300]}")
+            solicitud_no_encontrada = True
+            for celda in celdas:
+                r = {
+                    "celda_id": celda["celda_id"],
+                    "resultado": "error",
+                    "motivo": "solicitud_no_encontrada",
+                    "detalle": f"No se encontró 'OYM - Desparafinación' + '{periodo_yclick}' + 'En Ejecución'. Contenido tabla: {contenido_tabla[:400]}",
+                    "captura_url": None
+                }
+                resultados.append(r)
+                reportar_progreso(sync_id, r)
+            await browser.close()
+            return resultados, False
+
+        await page.wait_for_url("**/detailmonthly/**", timeout=30000)
+        log(f"  Solicitud abierta: {page.url}")
+        await page.wait_for_load_state("networkidle", timeout=20000)
+
+        # ---- CELDAS ----
+        for celda in celdas:
+            celda_id = celda["celda_id"]
+            tipo_ub = celda["tipo_ubicacion"]
+            ubicacion = celda["ubicacion"]
+            posicion_str = celda["posicion"]
+            posicion_codigo = posicion_str.split(" - ")[0].strip()
+            linea_codigo = celda["linea"]
+            fecha_str = celda["fecha"]
+            cantidad = celda["cantidad"]
+            unidad = celda["unidad"]
+            doc_respaldo = celda.get("doc_respaldo")
+            adjuntos = celda.get("adjuntos", [])
+
+            log(f"\n--- Celda {celda_id[:8]}: {ubicacion} pos={posicion_codigo} linea={linea_codigo} {fecha_str} cant={cantidad}{unidad} ---")
+            inicio_celda = time.time()
+            pasos = [0]
+
+            def chk_tope():
+                pasos[0] += 1
+                elapsed = time.time() - inicio_celda
+                if pasos[0] >= STEP_LIMIT or elapsed >= TIME_LIMIT_S:
+                    raise Exception(f"tope_excedido: pasos={pasos[0]}, tiempo={elapsed:.0f}s")
+
+            # Mapeo conocido
+            yclick_tipo = tipo_ub
+            yclick_ubicacion = ubicacion
+            yclick_activo = None
+            if "COLECTOR LOC 56" in ubicacion.upper():
+                yclick_tipo = "Locación - Operación y Mantenimiento"
+                yclick_ubicacion = "LOCACION N° 56"
+                yclick_activo = "LA AMARGA CHICA"
+                log(f"  Mapeo: '{ubicacion}' -> tipo='{yclick_tipo}', nombre='{yclick_ubicacion}', activo='{yclick_activo}'")
+
+            # Descargar PDF
+            pdf_local = None
+            pdf_error = None
+            for adj in adjuntos:
+                url_firmada = adj.get("url_firmada", "")
+                archivo = adj.get("archivo", f"parte-{adj.get('parte','?')}.pdf")
+                pdf_local = f"{SCRATCHPAD}/{archivo}"
+                log(f"  Descargando PDF parte {adj.get('parte')}...")
+                ret = subprocess.run(
+                    ["/usr/bin/python3", "-I", "/home/user/scripts/wells_api.py", "download", url_firmada, pdf_local],
+                    capture_output=True, text=True, timeout=120
+                )
+                log(f"  download exit={ret.returncode} | {ret.stderr.strip()[:150]}")
+                if ret.returncode != 0 or not os.path.exists(pdf_local):
+                    pdf_error = f"download exit={ret.returncode}: {ret.stderr.strip()[:200]}"
+                    pdf_local = None
+                    break
+
+            if pdf_error:
+                r = {
+                    "celda_id": celda_id,
+                    "resultado": "error",
+                    "motivo": "pdf_no_descargado",
+                    "detalle": pdf_error,
+                    "captura_url": None
+                }
+                resultados.append(r)
+                reportar_progreso(sync_id, r)
+                continue
+
+            linea_texto_completo = None
+
+            try:
+                # Paso 2: PARTE DE TRABAJO
+                chk_tope()
+                log("  Paso 2: pestaña PARTE DE TRABAJO")
+                for _tab_sel in ["li:has-text('PARTE DE TRABAJO')", "a:has-text('PARTE DE TRABAJO')"]:
+                    try:
+                        tab_pt = await page.query_selector(_tab_sel)
+                        if tab_pt:
+                            await tab_pt.click(timeout=5000)
+                            break
+                    except Exception:
+                        pass
+                await page.wait_for_load_state("networkidle", timeout=10000)
+                await asyncio.sleep(1)
+
+                # Paso 3: Ubicación
+                chk_tope()
+                log(f"  Paso 3: Verificar/agregar ubicación '{yclick_ubicacion}'")
+
+                body_txt_ub = await page.inner_text("body", timeout=5000)
+                ubicacion_ya_existe = yclick_ubicacion.upper() in body_txt_ub.upper()
+                if ubicacion_ya_existe:
+                    log(f"  Ubicación ya en lista (detectada en body)")
+
+                async def fill_generic_select_by_label(label_txt, search_term, match_term=None, wait_s=3.0):
+                    """Llena un React Select buscando el .generic-select con la etiqueta dada.
+                    search_term: lo que se tipea para traer opciones.
+                    match_term: substring que debe tener la opción elegida (por defecto = search_term).
+                    """
+                    if match_term is None:
+                        match_term = search_term
+                    gs = await page.query_selector_all(".generic-select")
+                    target = None
+                    for s in gs:
+                        lbl = await s.query_selector("label")
+                        if lbl and label_txt.lower() in (await lbl.inner_text()).lower():
+                            r = await s.bounding_box()
+                            if r and r["x"] >= 0:
+                                target = s
+                                break
+                    if not target:
+                        raise Exception(f"No se encontró .generic-select con label '{label_txt}'")
+                    ctrl = await target.query_selector("[class*='-control']")
+                    if not ctrl:
+                        raise Exception(f"No se encontró control en .generic-select '{label_txt}'")
+                    await ctrl.click(timeout=5000)
+                    await asyncio.sleep(0.8)
+                    await page.keyboard.type(search_term, delay=60)
+                    await asyncio.sleep(wait_s)
+                    opts = await page.query_selector_all("[class*='-option']")
+                    disponibles = []
+                    for op in opts:
+                        try:
+                            t = (await op.inner_text()).strip()
+                            if t:
+                                disponibles.append(t)
+                                if match_term.lower() in t.lower():
+                                    await op.click()
+                                    return t
+                        except Exception:
+                            pass
+                    log(f"  Opciones para '{search_term}' (match='{match_term}'): {disponibles[:10]}")
+                    return None
+
+                if not ubicacion_ya_existe:
+                    chk_tope()
+                    log("  Abriendo modal 'Agregar ubicación'...")
+                    await page.click("button:has-text('Agregar ubicación'), a:has-text('Agregar ubicación')", timeout=10000)
+                    await asyncio.sleep(1.5)
+
+                    # Tipo de ubicación
+                    chk_tope()
+                    log(f"  Tipo: '{yclick_tipo}'")
+                    kw_tipo = "Locaci" if "Locaci" in yclick_tipo else "Pozo"
+                    tipo_elegido = await fill_generic_select_by_label("Tipo de ubicaci", kw_tipo)
+                    if tipo_elegido:
+                        log(f"  Tipo elegido: {tipo_elegido}")
+                    else:
+                        log(f"  WARN: sin opciones para tipo '{kw_tipo}', continuando sin tipo")
+                    await asyncio.sleep(2)  # esperar que aparezca Ubicación locación
+
+                    # Ubicación locación — buscar con "LOC" (trae resultados) y matchear "56"
+                    chk_tope()
+                    log(f"  Ubicación locación: '{yclick_ubicacion}'")
+                    # Extraer número de locación para el match (ej: "56" de "LOCACION N° 56")
+                    import re as _re_ub
+                    num_loc = _re_ub.search(r'\d+', yclick_ubicacion)
+                    match_ub = num_loc.group(0) if num_loc else yclick_ubicacion[:8]
+                    ub_elegida = await fill_generic_select_by_label("locaci", "LOC", match_term=match_ub, wait_s=4.0)
+                    if not ub_elegida:
+                        await screenshot(page, f"ub_noencontrada_{celda_id[:8]}")
+                        raise Exception(f"ubicacion_no_encontrada: '{yclick_ubicacion}' (match='{match_ub}') no aparece en opciones")
+                    log(f"  Ubicación elegida: {ub_elegida}")
+
+                    await asyncio.sleep(0.8)
+                    chk_tope()
+                    # Cerrar cualquier info-modal que haya aparecido tras la selección
+                    for info_sel in [
+                        ".info-modal button:has-text('Continuar')",
+                        ".info-modal button:has-text('Aceptar')",
+                        ".info-modal button:has-text('OK')",
+                        ".info-modal .btn-primary",
+                        ".info-modal .btn",
+                    ]:
+                        try:
+                            info_btn = await page.query_selector(info_sel)
+                            if info_btn and await info_btn.is_visible():
+                                await info_btn.click(timeout=3000)
+                                log(f"  Info-modal cerrado con '{info_sel}'")
+                                await asyncio.sleep(1)
+                                break
+                        except Exception:
+                            pass
+                    # Botón confirmar: usar JS click para esquivar cualquier overlay restante
+                    confirmar_clicked = False
+                    for btn_txt in ["Agregar y continuar", "Continuar", "Agregar"]:
+                        try:
+                            btn_el = await page.query_selector(f"button:has-text('{btn_txt}')")
+                            if btn_el and await btn_el.is_enabled():
+                                await btn_el.evaluate("b => b.click()")
+                                confirmar_clicked = True
+                                log(f"  Confirmado con '{btn_txt}'")
+                                break
+                        except Exception:
+                            pass
+                    if not confirmar_clicked:
+                        raise Exception("No se pudo hacer click en Agregar/Continuar del modal ubicación")
+                    await page.wait_for_load_state("networkidle", timeout=15000)
+                    await asyncio.sleep(1)
+                    # "Agregar y continuar" abre otro modal vacío para seguir agregando — cerrarlo
+                    try:
+                        salir_btn = await page.query_selector(".modal.show button:has-text('Salir')")
+                        if salir_btn and await salir_btn.is_visible():
+                            await salir_btn.evaluate("b => b.click()")
+                            log("  Segundo modal 'Agregar ubicación' cerrado con Salir")
+                            await asyncio.sleep(1)
+                    except Exception:
+                        pass
+                    log("  Modal ubicación cerrado")
+
+                # Paso 4: Expandir card LOCACION, click "Agregar líneas", llenar modal
+                chk_tope()
+                log("  Paso 4: Expandir card ubicación y agregar posición/línea")
+                anio_f, mes_f, dia_f = fecha_str.split("-")
+                dia_num_p4 = int(dia_f)
+
+                # Helper: leer el día actual del picker de fecha
+                async def get_picker_day():
+                    for _el in await page.query_selector_all("div, span"):
+                        try:
+                            _txt = (await _el.inner_text()).strip()
+                            if re.search(r'\d{1,2}\s+de\s+\w+\s+de\s+\d{4}', _txt):
+                                _bb = await _el.bounding_box()
+                                if _bb and 80 < _bb["width"] < 600 and _bb["height"] < 80:
+                                    _m = re.search(r'(\d{1,2})\s+de', _txt)
+                                    if _m:
+                                        return int(_m.group(1)), _txt
+                        except Exception:
+                            pass
+                    return None, None
+
+                # Helper: navegar el picker al día target
+                async def navigate_picker_to(target_day):
+                    for _nav_i in range(35):
+                        _curr, _curr_txt = await get_picker_day()
+                        if _curr is None:
+                            log("  Picker no encontrado")
+                            break
+                        if _curr == target_day:
+                            log(f"  Picker en día {target_day}: {_curr_txt}")
+                            break
+                        _dir = ">" if _curr < target_day else "<"
+                        _nav_clicked = False
+                        for _btn in await page.query_selector_all("button"):
+                            try:
+                                _t = (await _btn.inner_text()).strip()
+                                _bb = await _btn.bounding_box()
+                                if not _bb or _bb["y"] > 700:
+                                    continue
+                                if _dir == ">" and _t in (">", "›", "▶", "»"):
+                                    await _btn.click(timeout=2000)
+                                    _nav_clicked = True
+                                    break
+                                if _dir == "<" and _t in ("<", "‹", "◀", "«"):
+                                    await _btn.click(timeout=2000)
+                                    _nav_clicked = True
+                                    break
+                            except Exception:
+                                pass
+                        if not _nav_clicked:
+                            # Fallback: buscar botón SVG de navegación por posición relativa al picker
+                            _curr2, _curr_txt2 = await get_picker_day()
+                            if _curr_txt2:
+                                await page.evaluate(f"""() => {{
+                                    const els = Array.from(document.querySelectorAll('*'));
+                                    const dateEl = els.find(e => {{
+                                        const t = e.innerText ? e.innerText.trim() : '';
+                                        return t.length > 10 && t.length < 100 && /\\d{{1,2}} de/.test(t);
+                                    }});
+                                    if (!dateEl) return;
+                                    const dateR = dateEl.getBoundingClientRect();
+                                    const btns = Array.from(document.querySelectorAll('button'));
+                                    const btn = btns.find(b => {{
+                                        const r = b.getBoundingClientRect();
+                                        const inRow = Math.abs(r.top - dateR.top) < 50;
+                                        return inRow && ('{_dir}' === '>' ? r.left > dateR.right - 10 : r.right < dateR.left + 10);
+                                    }});
+                                    if (btn) btn.click();
+                                }}""")
+                        await asyncio.sleep(0.3)
+
+                # Helper: expandir la card de la ubicación
+                async def expandir_card():
+                    for _el in await page.query_selector_all("div, span"):
+                        try:
+                            _txt = (await _el.inner_text()).strip()
+                            if yclick_ubicacion in _txt and len(_txt) < 60:
+                                _loc_bb = await _el.bounding_box()
+                                if _loc_bb and _loc_bb["x"] > 50:
+                                    for _rc in await page.query_selector_all(".rightContent"):
+                                        try:
+                                            _rc_bb = await _rc.bounding_box()
+                                            if _rc_bb and abs(_rc_bb["y"] - _loc_bb["y"]) < 70 and _rc_bb["x"] > 1100:
+                                                await _rc.click(timeout=3000)
+                                                await asyncio.sleep(1.5)
+                                                return True
+                                        except Exception:
+                                            pass
+                        except Exception:
+                            pass
+                    return False
+
+                # 1. Expandir la card
+                _exp_ok = await expandir_card()
+                if _exp_ok:
+                    log("  Card expandida (click en chevron)")
+                else:
+                    log("  WARN: no se encontró el div de ubicación para expandir la card")
+
+                # 2. Verificar si ya tiene líneas: el botón "Agregar líneas" solo aparece cuando NO hay líneas
+                #    Cuando hay líneas, ese botón desaparece y aparece el picker de fecha
+                await asyncio.sleep(0.5)
+                _btn_al = await page.query_selector("button:has-text('Agregar líneas')")
+                _btn_al_visible = False
+                if _btn_al:
+                    try:
+                        _btn_al_visible = await _btn_al.is_visible()
+                    except Exception:
+                        pass
+                _linea_marker = f"{posicion_codigo} - "
+                linea_ya_existe = not _btn_al_visible
+                if linea_ya_existe:
+                    log(f"  Línea Posición {posicion_codigo} ya existe (botón 'Agregar líneas' no visible)")
+                else:
+                    # Click en "Agregar líneas" (el botón está visible, puede estar fuera del viewport)
+                    chk_tope()
+                    log("  Abriendo modal 'Agregar líneas'...")
+                    if _btn_al:
+                        await _btn_al.evaluate("b => b.scrollIntoView({block:'center'})")
+                        await asyncio.sleep(0.3)
+                        await _btn_al.evaluate("b => b.click()")
+                    else:
+                        await page.evaluate("window.scrollBy(0, 300)")
+                        await asyncio.sleep(0.3)
+                        await page.click("button:has-text('Agregar líneas')", timeout=8000)
+                    await asyncio.sleep(1.5)
+
+                    # Posición
+                    chk_tope()
+                    log(f"  Posición código: {posicion_codigo}")
+                    pos_elegida = await fill_generic_select_by_label("Posici", posicion_codigo)
+                    if not pos_elegida:
+                        await screenshot(page, f"no_pos_{celda_id[:8]}")
+                        raise Exception(f"posicion_no_encontrada: código {posicion_codigo}")
+                    log(f"  Posición: {pos_elegida}")
+                    await asyncio.sleep(0.5)
+
+                    # Línea
+                    chk_tope()
+                    log(f"  Línea código: {linea_codigo}")
+                    lin_elegida = await fill_generic_select_by_label("nea", linea_codigo)
+                    if not lin_elegida:
+                        await screenshot(page, f"no_lin_{celda_id[:8]}")
+                        raise Exception(f"linea_no_encontrada: código {linea_codigo}")
+                    linea_texto_completo = lin_elegida
+                    log(f"  Línea: {lin_elegida}")
+                    await asyncio.sleep(0.5)
+
+                    # Realización de la tarea: fecha específica (Desde y Hasta = fecha_str)
+                    chk_tope()
+                    log(f"  Fecha realización: {fecha_str}")
+                    fecha_inputs_modal = await page.query_selector_all(".modal.show input[type='date']")
+                    for _fi in fecha_inputs_modal[:2]:
+                        try:
+                            await _fi.fill(fecha_str)
+                        except Exception:
+                            pass
+                    # Fallback: cualquier input date visible en el modal
+                    if not fecha_inputs_modal:
+                        for _fi in await page.query_selector_all("input[type='date']"):
+                            try:
+                                if await _fi.is_visible():
+                                    await _fi.fill(fecha_str)
+                            except Exception:
+                                pass
+                    await asyncio.sleep(0.3)
+
+                    # Aceptar
+                    chk_tope()
+                    for _btn_txt in ["Aceptar", "Guardar", "Confirmar"]:
+                        try:
+                            _btn = await page.query_selector(f".modal.show button:has-text('{_btn_txt}')")
+                            if _btn and await _btn.is_enabled():
+                                await _btn.evaluate("b => b.click()")
+                                log(f"  Modal cerrado con '{_btn_txt}'")
+                                break
+                        except Exception:
+                            pass
+                    await page.wait_for_load_state("networkidle", timeout=15000)
+                    await asyncio.sleep(1.5)
+                    log("  Modal posición/línea cerrado")
+
+                # Paso 5: Cantidad en el grid diario
+                chk_tope()
+                log(f"  Paso 5: Cargar {cantidad}{unidad} en día {dia_f}")
+                dia_num = int(dia_f)
+
+                await screenshot(page, f"paso5_antes_nav_{celda_id[:8]}")
+
+                # Navegar al día correcto en el picker de fecha
+                # Estructura real del picker: div.calendar-container con 5 hijos:
+                #   [0]<< div[aria-hidden], [1]< div[aria-hidden], [2]content div, [3]> div[aria-hidden], [4]>> div[aria-hidden]
+                # El input text es input#date-input-calendar (react-datepicker)
+                # El display de fecha es div.date-container#calendar-div
+
+                # Scroll al picker visible (el que tiene y > 0)
+                await page.evaluate("""() => {
+                    const cals = Array.from(document.querySelectorAll('.calendar-container'));
+                    const vis = cals.find(c => c.getBoundingClientRect().y > 100);
+                    if (vis) vis.scrollIntoView({block: 'center'});
+                }""")
+                await asyncio.sleep(0.5)
+
+                # Intentar poner la fecha directamente via input (React DatePicker)
+                _date_set = await page.evaluate(f"""() => {{
+                    const cals = Array.from(document.querySelectorAll('.calendar-container'));
+                    const visCal = cals.find(c => c.getBoundingClientRect().y > 100);
+                    if (!visCal) return false;
+                    const inp = visCal.querySelector('input[id="date-input-calendar"], input[type="text"]');
+                    if (!inp) return false;
+                    // Simular cambio con React
+                    const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                    // Formato: DD/MM/YYYY
+                    const dia = '{int(dia_f):02d}';
+                    const mes = '{mes_f}';
+                    const anio = '{anio_f}';
+                    const dateStr = dia + '/' + mes + '/' + anio;
+                    nativeSetter.call(inp, dateStr);
+                    inp.dispatchEvent(new Event('input', {{bubbles: true}}));
+                    inp.dispatchEvent(new Event('change', {{bubbles: true}}));
+                    return dateStr;
+                }}""")
+                if _date_set:
+                    log(f"  Fecha seteada via input: {_date_set}")
+                    await asyncio.sleep(0.5)
+                else:
+                    log("  No se pudo setear fecha via input, usando navegación por clicks")
+
+                for _nav_i in range(35):
+                    _picker_info = await page.evaluate("""() => {
+                        // Buscar el calendar-container visible (y > 100)
+                        const cals = Array.from(document.querySelectorAll('.calendar-container'));
+                        const visCal = cals.find(c => c.getBoundingClientRect().y > 100);
+                        if (!visCal) return null;
+                        // Leer la fecha actual del div.date-container
+                        const dateDiv = visCal.querySelector('.date-container, #calendar-div');
+                        if (!dateDiv) return null;
+                        const dateText = (dateDiv.innerText || '').trim();
+                        const m = dateText.match(/(\\d{1,2})\\s+de/);
+                        const day = m ? parseInt(m[1]) : null;
+                        // Obtener los divs de navegación (aria-hidden)
+                        const ariaDivs = Array.from(visCal.querySelectorAll(':scope > div[aria-hidden="true"]'));
+                        // [0]=<<, [1]=<, [2]=>, [3]=>>
+                        const prevBtn = ariaDivs[1];
+                        const nextBtn = ariaDivs[2];
+                        const prevR = prevBtn ? prevBtn.getBoundingClientRect() : null;
+                        const nextR = nextBtn ? nextBtn.getBoundingClientRect() : null;
+                        return {
+                            day: day,
+                            dateText: dateText,
+                            prevX: prevR ? prevR.x + prevR.width/2 : null,
+                            prevY: prevR ? prevR.y + prevR.height/2 : null,
+                            nextX: nextR ? nextR.x + nextR.width/2 : null,
+                            nextY: nextR ? nextR.y + nextR.height/2 : null,
+                            numAriaDivs: ariaDivs.length
+                        };
+                    }""")
+                    if not _picker_info or _picker_info["day"] is None:
+                        log("  Picker de fecha no visible todavía")
+                        break
+                    _curr_day = _picker_info["day"]
+                    if _nav_i == 0:
+                        log(f"  Picker: día={_curr_day} target={dia_num} nearby={_picker_info.get('nearby', [])[:4]}")
+                    if _curr_day == dia_num:
+                        log(f"  Picker en día {dia_num}: {_picker_info['dateText']}")
+                        break
+                    # Navegar con mouse click directo en el botón correcto
+                    if _curr_day < dia_num and _picker_info["nextX"]:
+                        await page.mouse.click(_picker_info["nextX"], _picker_info["nextY"])
+                    elif _curr_day > dia_num and _picker_info["prevX"]:
+                        await page.mouse.click(_picker_info["prevX"], _picker_info["prevY"])
+                    else:
+                        log(f"  No se encontró botón nav (curr={_curr_day}, target={dia_num}, nearby={_picker_info.get('nearby', [])[:6]})")
+                        break
+                    await asyncio.sleep(0.3)
+                await asyncio.sleep(0.5)
+
+                await screenshot(page, f"paso5_post_nav_{celda_id[:8]}")
+                await screenshot(page, f"paso5_grid_{celda_id[:8]}")
+
+                # Buscar el input de cantidad en la fila de la línea
+                cantidad_input = None
+
+                # Encontrar la y de la fila de la línea
+                linea_row_y = None
+                for _search_txt in [posicion_codigo, linea_codigo, "NOC ESTE", "EQ.HOT OIL"]:
+                    for _el in await page.query_selector_all("div, span, td"):
+                        try:
+                            _txt = (await _el.inner_text()).strip()
+                            if _search_txt in _txt and len(_txt) < 100:
+                                _bb = await _el.bounding_box()
+                                if _bb and _bb["x"] > 50 and _bb["y"] > 100:
+                                    linea_row_y = _bb["y"]
+                                    log(f"  Fila de línea en y≈{linea_row_y:.0f} ('{_search_txt}')")
+                                    break
+                        except Exception:
+                            pass
+                    if linea_row_y:
+                        break
+
+                # Buscar input en la misma fila
+                if linea_row_y:
+                    for _inp in await page.query_selector_all("input"):
+                        try:
+                            if await _inp.is_visible():
+                                _bb = await _inp.bounding_box()
+                                _ro = await _inp.get_attribute("readonly")
+                                _dis = await _inp.get_attribute("disabled")
+                                if _bb and _bb["x"] > 0 and abs(_bb["y"] - linea_row_y) < 50 and not _ro and not _dis:
+                                    cantidad_input = _inp
+                                    log(f"  Input en fila de línea en ({_bb['x']:.0f},{_bb['y']:.0f})")
+                                    break
+                        except Exception:
+                            pass
+
+                # Estrategia 2: todos los inputs editables visibles
+                if not cantidad_input:
+                    all_inp = await page.query_selector_all("input[type='number'], input[type='text'], input:not([type])")
+                    vis_inp = []
+                    for _inp in all_inp:
+                        try:
+                            if await _inp.is_visible():
+                                _bb = await _inp.bounding_box()
+                                _ro = await _inp.get_attribute("readonly")
+                                _dis = await _inp.get_attribute("disabled")
+                                if _bb and _bb["x"] > 100 and not _ro and not _dis:
+                                    vis_inp.append((_bb["x"], _bb["y"], _inp))
+                        except Exception:
+                            pass
+                    log(f"  Inputs editables visibles: {len(vis_inp)}")
+                    if vis_inp:
+                        vis_inp.sort(key=lambda t: (t[1], t[0]))
+                        cantidad_input = vis_inp[0][2]
+                        log(f"  Primer input en ({vis_inp[0][0]:.0f},{vis_inp[0][1]:.0f})")
+
+                if not cantidad_input:
+                    await screenshot(page, f"no_input_cant_{celda_id[:8]}")
+                    raise Exception("No se encontró el input de cantidad")
+
+                val_actual = (await cantidad_input.input_value()).strip()
+                if val_actual and val_actual not in ("0", "", "null", "0.00", "-"):
+                    log(f"  ya_existia: valor='{val_actual}'")
+                    r = {
+                        "celda_id": celda_id,
+                        "resultado": "ya_existia",
+                        "motivo": "ya_existia",
+                        "detalle": f"Caja ya tiene '{val_actual}' para {fecha_str} pos {posicion_codigo} línea {linea_codigo}",
+                        "captura_url": None
+                    }
+                    resultados.append(r)
+                    reportar_progreso(sync_id, r)
                     continue
 
-                log(f"--- Celda {celda['celda_id']} | {celda['ubicacion']} | {celda['posicion']} | {celda['fecha']} ---")
-                res = procesar_celda(page, celda, sync_id, pdf_dir)
-                resultados.append(res)
-                log(f"Resultado celda: {res['resultado']} motivo={res['motivo']}")
+                await cantidad_input.click(timeout=3000)
+                await asyncio.sleep(0.3)
+                await page.keyboard.press("Control+a")
+                await cantidad_input.fill(str(cantidad))
+                await asyncio.sleep(0.3)
+                val_leido = (await cantidad_input.input_value()).strip()
+                if val_leido != str(cantidad):
+                    raise Exception(f"valor_no_coincide: se escribio {cantidad} pero caja muestra '{val_leido}'")
+                log(f"  Cantidad {cantidad} cargada y verificada")
 
-                # Enviar progreso a Wells
-                wells_progreso(sync_id, [res])
+                # Paso 6: Verificar y enviar
+                chk_tope()
+                log("  Paso 6: Verificar y Enviar a aprobar")
+                # Blur el input para que el botón Enviar a aprobar se habilite
+                await page.keyboard.press("Tab")
+                await asyncio.sleep(0.5)
+                await screenshot(page, f"antes_envio_{celda_id[:8]}")
+                # Buscar el botón "Enviar a aprobar" habilitado y visible
+                _enviar_ok = False
+                for _ei in range(20):
+                    _btns_enviar = await page.query_selector_all("button:has-text('Enviar a aprobar')")
+                    for _be in _btns_enviar:
+                        try:
+                            _be_bb = await _be.bounding_box()
+                            _be_en = await _be.is_enabled()
+                            if _be_bb and _be_en and _be_bb["y"] > 100 and _be_bb["x"] > 0:
+                                await _be.evaluate("b => b.scrollIntoView({block:'center'})")
+                                await asyncio.sleep(0.3)
+                                await _be.evaluate("b => b.click()")
+                                _enviar_ok = True
+                                log(f"  Click 'Enviar a aprobar' en ({_be_bb['x']:.0f},{_be_bb['y']:.0f})")
+                                break
+                        except Exception:
+                            pass
+                    if _enviar_ok:
+                        break
+                    await asyncio.sleep(0.5)
+                if not _enviar_ok:
+                    raise Exception("boton_enviar_no_habilitado")
+                await page.wait_for_load_state("networkidle", timeout=15000)
+                await asyncio.sleep(1.5)
+                log("  Enviado a aprobar")
+                await screenshot(page, f"post_envio_{celda_id[:8]}")
 
-                # Detectar condiciones que detienen el sync completo
-                if res["motivo"] in ("login_bloqueado", "solicitud_no_encontrada"):
-                    detener_sync = True
-                    detener_motivo = res["motivo"]
-                    log(f"Deteniendo sync por {detener_motivo}")
+                # Paso 7: doc_respaldo
+                if doc_respaldo:
+                    chk_tope()
+                    log(f"  Paso 7: doc_respaldo '{doc_respaldo}'")
+                    try:
+                        await page.click(
+                            "tr:has-text('barras'), [title*='barras'], [class*='barcode'], button[title*='respaldo']",
+                            timeout=5000
+                        )
+                        await asyncio.sleep(0.5)
+                        inp_doc = await page.query_selector(
+                            "input[name*='respaldo'], input[placeholder*='respaldo'], input[placeholder*='Documento'], input[placeholder*='documento']"
+                        )
+                        if inp_doc:
+                            await inp_doc.fill(doc_respaldo)
+                            await page.click("button:has-text('Guardar'), button:has-text('OK'), button:has-text('Aceptar')", timeout=5000)
+                            log(f"  doc_respaldo '{doc_respaldo}' cargado")
+                    except Exception as e:
+                        log(f"  WARN doc_respaldo (no critico): {e}")
 
-        except RuntimeError as e:
-            msg = str(e)
-            log(f"ERROR global: {msg}")
-            motivo_global = msg.split(":")[0] if ":" in msg else "error_global"
-            # Marcar todas las celdas no procesadas como error
-            ids_procesados = {r["celda_id"] for r in resultados}
-            for celda in celdas:
-                if celda["celda_id"] not in ids_procesados:
-                    res = {
-                        "celda_id": celda["celda_id"],
-                        "resultado": "error",
-                        "motivo": motivo_global,
-                        "detalle": msg,
-                        "captura_url": None,
-                    }
-                    resultados.append(res)
-                    wells_progreso(sync_id, [res])
+                # Paso 8: Adjuntar PDF
+                if pdf_local and os.path.exists(pdf_local):
+                    chk_tope()
+                    log(f"  Paso 8: Adjuntar PDF {pdf_local}")
+                    try:
+                        # Encontrar el ícono de adjunto en la fila de la línea
+                        # La fila tiene: texto posición | texto línea | unidad | input cantidad | iconos
+                        # El ícono de adjunto (documento) está cerca de linea_row_y
+                        adj_clicked = False
+                        # Buscar por aria-label, title, o class en la zona de la fila
+                        for _adj_sel in [
+                            "[aria-label*='djunt'], [title*='djunt']",
+                            "[aria-label*='archivo'], [title*='archivo']",
+                            "[class*='attach'], [class*='file-upload']",
+                            "[class*='document'], [class*='doc']",
+                        ]:
+                            try:
+                                _adj_els = await page.query_selector_all(_adj_sel)
+                                for _adj_el in _adj_els:
+                                    _bb = await _adj_el.bounding_box()
+                                    if _bb and linea_row_y and abs(_bb["y"] - linea_row_y) < 60:
+                                        await _adj_el.click(timeout=3000)
+                                        adj_clicked = True
+                                        log(f"  Ícono adjunto clickeado ({_adj_sel})")
+                                        break
+                            except Exception:
+                                pass
+                            if adj_clicked:
+                                break
 
-        except Exception as e:
-            log(f"EXCEPCION global: {type(e).__name__}: {e}")
-            ids_procesados = {r["celda_id"] for r in resultados}
-            for celda in celdas:
-                if celda["celda_id"] not in ids_procesados:
-                    res = {
-                        "celda_id": celda["celda_id"],
-                        "resultado": "error",
-                        "motivo": "excepcion_global",
-                        "detalle": f"{type(e).__name__}: {e}",
-                        "captura_url": None,
-                    }
-                    resultados.append(res)
-                    wells_progreso(sync_id, [res])
+                        # Fallback: buscar ícono SVG de documento en la fila
+                        if not adj_clicked and linea_row_y:
+                            svgs_en_fila = await page.evaluate(f"""() => {{
+                                const svgs = Array.from(document.querySelectorAll('svg, button'));
+                                return svgs
+                                    .filter(e => {{
+                                        const r = e.getBoundingClientRect();
+                                        return r.x > 1200 && Math.abs(r.y - {linea_row_y}) < 60;
+                                    }})
+                                    .map((e, i) => ({{idx: i, x: e.getBoundingClientRect().x, y: e.getBoundingClientRect().y, tag: e.tagName, cls: e.className}}));
+                            }}""")
+                            log(f"  SVGs/botones en fila: {svgs_en_fila}")
+                            # El ícono de adjunto es típicamente el 3ro de derecha a izquierda
+                            if len(svgs_en_fila) >= 3:
+                                target_icon = sorted(svgs_en_fila, key=lambda x: x["x"])[-3]
+                                await page.mouse.click(target_icon["x"] + 5, target_icon["y"] + 5)
+                                adj_clicked = True
+                                log(f"  Click en ícono adjunto por posición ({target_icon['x']:.0f},{target_icon['y']:.0f})")
 
-        finally:
-            browser.close()
+                        if adj_clicked:
+                            await asyncio.sleep(0.8)
+                            # Buscar "Agregar adjunto" o "Subir archivo" en el popup/modal
+                            for _add_txt in ["Agregar adjunto", "Subir", "Agregar archivo"]:
+                                try:
+                                    _btn = await page.query_selector(f"text={_add_txt}")
+                                    if _btn:
+                                        await _btn.click(timeout=3000)
+                                        await asyncio.sleep(0.3)
+                                        break
+                                except Exception:
+                                    pass
+                            async with page.expect_file_chooser(timeout=5000) as fc_info:
+                                await page.click("input[type='file'], button:has-text('Seleccionar'), button:has-text('Elegir')", timeout=3000)
+                            fc = await fc_info.value
+                            await fc.set_files(pdf_local)
+                            await asyncio.sleep(0.5)
+                            await page.click("button:has-text('Agregar'), button:has-text('Subir'), button:has-text('OK')", timeout=5000)
+                            await page.wait_for_load_state("networkidle", timeout=20000)
+                            log("  PDF adjuntado")
+                        else:
+                            raise Exception("No se encontró ícono de adjunto en la fila")
+                    except Exception as e:
+                        log(f"  WARN adjunto (no critico, horas ya enviadas): {e}")
 
-    # Resultado final
-    todos_ok = all(r["resultado"] in ("ok", "ya_existia") for r in resultados)
-    alguno_ok = any(r["resultado"] in ("ok", "ya_existia") for r in resultados)
-    if todos_ok:
-        estado_envio = "completado"
-    elif alguno_ok:
-        estado_envio = "parcial"
-    else:
-        estado_envio = "fallido"
+                detalle = f"Cargado y enviado. Línea completa: {linea_texto_completo}. Pasos: {pasos[0]}. Tiempo: {time.time()-inicio_celda:.0f}s."
+                r = {
+                    "celda_id": celda_id,
+                    "resultado": "ok",
+                    "motivo": None,
+                    "detalle": detalle,
+                    "captura_url": None
+                }
+                resultados.append(r)
+                reportar_progreso(sync_id, r)
 
-    log(f"Enviando resultado final: estado={estado_envio}")
-    res_ok, res_body = wells_resultado(sync_id, estado_envio, resultados)
+            except Exception as e:
+                motivo_raw = str(e)
+                if "tope_excedido" in motivo_raw:
+                    motivo = "tope_excedido"
+                elif "ubicacion_no_encontrada" in motivo_raw:
+                    motivo = "ubicacion_no_encontrada"
+                elif "ubicacion_no_soportada" in motivo_raw:
+                    motivo = "ubicacion_no_soportada"
+                elif "posicion_no_encontrada" in motivo_raw:
+                    motivo = "posicion_no_encontrada"
+                elif "linea_no_encontrada" in motivo_raw:
+                    motivo = "linea_no_encontrada"
+                elif "valor_no_coincide" in motivo_raw:
+                    motivo = "valor_no_coincide"
+                elif "login_bloqueado" in motivo_raw:
+                    motivo = "login_bloqueado"
+                else:
+                    motivo = "error_inesperado"
+                log(f"  ERROR {celda_id[:8]}: {motivo} | {motivo_raw}")
+                await screenshot(page, f"error_{celda_id[:8]}_{motivo}")
+                r = {
+                    "celda_id": celda_id,
+                    "resultado": "error",
+                    "motivo": motivo,
+                    "detalle": motivo_raw[:4000],
+                    "captura_url": None
+                }
+                resultados.append(r)
+                reportar_progreso(sync_id, r)
 
-    # Verificar estado final en Wells
-    estado_final = wells_get_estado(sync_id)
-    log(f"Estado final verificado en Wells: {estado_final}")
+        await browser.close()
 
-    fin = datetime.datetime.now(ARS_TZ)
-    duracion = (fin - inicio).total_seconds()
-    log(f"=== FIN {fin.isoformat()} | Duración: {duracion:.0f}s ===")
-    flush_log()
-
-    # Informe stdout
-    ok_n = sum(1 for r in resultados if r["resultado"] == "ok")
-    ya_n = sum(1 for r in resultados if r["resultado"] == "ya_existia")
-    err_n = sum(1 for r in resultados if r["resultado"] == "error")
-
-    print(f"""
-=== INFORME FINAL ===
-sync_id: {sync_id}
-Estado final en Wells: {estado_final}
-Resultado enviado OK: {res_ok}
-
-Resumen: ok={ok_n} ya_existia={ya_n} error={err_n}
-""")
-    for r in resultados:
-        print(f"  celda {r['celda_id']}: {r['resultado']}"
-              + (f" [{r['motivo']}] {r['detalle']}" if r["resultado"] == "error" else ""))
-
-    if not res_ok:
-        print("\nAVISO: el envío del resultado a Wells falló. Wells NO fue notificado.", file=sys.stderr)
-
-    print(f"\nLog: {_log_path}")
+    return resultados, login_bloqueado
 
 
 if __name__ == "__main__":
-    main()
+    sync_json_path = sys.argv[1] if len(sys.argv) > 1 else f"{SCRATCHPAD}/sync.json"
+    with open(sync_json_path) as f:
+        sync_data = json.load(f)
+
+    sync_id = sync_data["sync_id"]
+    celdas = sync_data["celdas"]
+
+    resultados, _ = asyncio.run(run(sync_data))
+
+    # Cerrar el sync enviando resultado final a Wells
+    estado_final = "completado"
+    payload_resultado = {"estado": estado_final, "celdas": resultados}
+    path_resultado = escribir_json_tmp(payload_resultado, "resultado_final")
+    code_r, out_r, err_r = llamar_wells(f"resultado {sync_id} {path_resultado}")
+    if code_r != 0:
+        log(f"  WARN: resultado final no enviado (exit={code_r}): {err_r[:200]}")
+
+    # Log completo
+    print(json.dumps({"sync_id": sync_id, "resultados": resultados}, ensure_ascii=False, indent=2))

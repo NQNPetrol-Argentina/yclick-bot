@@ -1,6 +1,6 @@
 # Y-Click — pasos de carga para el bot (v1, armado con el video del parte 23359)
 
-> **Estado:** recorrido completo visto en video (carga del parte 23359, pozo SOil-402(h), domingo 01/11/2026, equipo HO29) y ejecutado en prod (sync 7a878343 parte 23509 y sync d69fa947 parte 23509, 10/11/2026 — colector LOC 56, posición 31, 9H, PDF + doc_respaldo LC3). Lo marcado con **⚠️** no se vio o hay que confirmarlo con Fabio.
+> **Estado:** recorrido completo visto en video (carga del parte 23359, pozo SOil-402(h), domingo 01/11/2026, equipo HO29) y ejecutado en prod (sync 7a878343 parte 23509 y sync d69fa947 parte 23509, 10/11/2026 — colector LOC 56, posición 31, 9H, PDF + doc_respaldo LC3; sync fedac4af parte 23303, LACh-336(h), posición 31, 9H, 02/11/2026, 12/11/2026). Lo marcado con **⚠️** no se vio o hay que confirmarlo con Fabio.
 > Este documento es la base de las instrucciones del bot. Wells le da los datos; el bot no decide nada.
 
 ---
@@ -158,15 +158,21 @@ Si el payload trae `doc_respaldo` (ej. `LC3`), cargarlo **después** de «Enviar
 
 **Flujo UI (confirmado en prod):**
 1. Descargar el PDF desde la `url_firmada` a un archivo local con `wells_api.py download`.
-2. Click en el **3er ícono** de la fila (clase `button_work_report`, el más a la izquierda de los íconos con esa clase — x ≈ 1193). Se abre el modal **«Archivos adjuntos»**.
+2. **Encontrar el 3er botón (índice 2) de la fila** — ver sección «Botones de fila por DOM» en Detalles de implementación. No buscar por clase; buscar por posición x relativa a la fila. Es el primer botón con clase `button_work_report` (Archivos adjuntos). Se abre el modal **«Archivos adjuntos»**.
 3. El modal tiene dos secciones (acordeón):
    - **«Archivos de la solicitud»** (1a) — para adjuntos de toda la solicitud.
-   - **«Archivos '[descripción de línea]'»** (2a) — para adjuntos de **esta línea**. Expandir esta.
-4. En la sección de la línea, hacer click en «**Agregar adjunto**» (o el botón de paperclip). Aparece un `input[type=file]`.
-5. Usar `input.set_input_files(pdf_path)` — no simular click en el input de archivo.
-6. Click en el botón **«Agregar»** (distinto del «Agregar adjunto»). Aparece el aviso «Adjuntando archivos».
+   - **«Archivos "[descripción de línea]"»** (2a) — para adjuntos de **esta línea**. Expandir esta.
+   - Para expandir la 2a sección: `page.locator('text=Archivos "').nth(1)` (o el localizador que contiene el código de posición), obtener `bounding_box()` y hacer `page.mouse.click(cx, cy)`. **No usar `locator.click()`** — puede estar parcialmente fuera del viewport.
+4. En la sección de la línea, hacer click en «**Agregar adjunto**»:
+   - El elemento `<span>Agregar adjunto</span>` existe en el DOM pero Playwright lo considera «not visible» → `locator.click()` lanza `TimeoutError`.
+   - Usar `page.mouse.click(cx, cy)` con las coordenadas del `bounding_box()` del span o del div botón padre. El botón está aproximadamente en x=1137, w=180, h=33.
+   - Tras el click aparece un `input[type=file]`.
+5. Usar `page.locator("input[type='file']").first.set_input_files(pdf_path)` — no simular click en el input de archivo. Tipos aceptados: `pdf,.PDF,.jpg,.JPG,.jpeg,.JPEG,.msg,.xls,.xlsx,.png,.doc,.docx,.pptx,.ppt`.
+6. Click en el botón **«Agregar»** (distinto del «Agregar adjunto», está al pie del modal — x≈832, y≈682). **No es «Aceptar»**, el texto real es **«Agregar»**.
+   - Usar `page.mouse.click(870, 703)` o localizar con `page.locator('button:has-text("Agregar")').last`. Aparece el aviso «Adjuntando archivos, por favor espere.».
 7. Esperar a que el aviso desaparezca y verificar que el nombre del PDF aparece en la lista.
-8. **Si el PDF no queda en lista**: `error` con motivo `adjunto_no_confirmado`.
+8. **Si aparece un error de Y-Click** (texto tipo `7d06b39a — Ocurrió un error inesperado`): capturar texto exacto, reportar `adjunto_no_confirmado` con el detalle. Puede ocurrir si la línea ya fue aprobada o procesada.
+9. **Si el PDF no queda en lista (y no hay error visible)**: `error` con motivo `adjunto_no_confirmado`.
 
 ### Paso 9 — Resultado
 
@@ -202,7 +208,77 @@ Por cada celda: `ok`, `ya_existia` o `error`.
 - Chromium pre-instalado en **`/opt/pw-browsers/chromium-1243/chrome-linux64/chrome`**.
   - Playwright 1.65 busca `chromium_headless_shell-1254` que no existe. Siempre especificar `executable_path`.
 - Lanzar con `args=["--no-sandbox"]`.
-- Siempre invocar el bot con la bandera `-I`: `/usr/bin/python3 -I scripts/bot_yclick.py <sync_id>`.
+- Invocar el bot: `/usr/bin/python3 -I scripts/bot_yclick.py <sync_json_path>` donde `sync_json_path` es la ruta al archivo JSON descargado con `wells_api.py get` (no el sync_id directamente).
+
+### Botones de fila por DOM
+
+Los íconos de acción de cada fila no se encuentran de forma fiable por clase CSS sola (puede haber varias filas con las mismas clases). El método correcto es:
+
+```python
+row_btns = await page.evaluate("""(posicion) => {
+    // Encontrar el elemento de texto con el código de posición
+    const elPos = Array.from(document.querySelectorAll('*')).find(
+        el => el.children.length === 0
+           && el.textContent.trim().startsWith(posicion)
+           && el.getBoundingClientRect().width > 0
+    );
+    const rowY = elPos.getBoundingClientRect().top;
+    // Filtrar todos los botones dentro de ±40px en y, x > 1050, ordenar por x
+    return Array.from(document.querySelectorAll('button'))
+        .filter(b => {
+            const r = b.getBoundingClientRect();
+            return Math.abs(r.top - rowY) < 40 && r.left > 1050 && r.width > 0;
+        })
+        .sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left)
+        .map(b => ({ cls: b.className,
+                     x: Math.round(b.getBoundingClientRect().left),
+                     y: Math.round(b.getBoundingClientRect().top),
+                     w: Math.round(b.getBoundingClientRect().width),
+                     h: Math.round(b.getBoundingClientRect().height) }));
+}""", str(posicion))
+# row_btns[0] = supporting_document
+# row_btns[1] = button_send_work_report
+# row_btns[2] = button_work_report (Archivos adjuntos)
+# row_btns[3] = button_work_report (Notas)
+# row_btns[4] = button_work_report_menu (⋮)
+```
+
+Hacer click por coordenadas: `await page.mouse.click(btn['x'] + btn['w']//2, btn['y'] + btn['h']//2)`.
+
+### Expandir una card de ubicación
+
+La card de una ubicación (ej. LACh-336(h)) se expande con el ícono chevron que está en el extremo derecho de la fila. No usar el menú ⋮ (que está más a la izquierda). El chevron SVG visible en prod está a x≈1371 (puede variar con el layout). Localizar con:
+
+```python
+lach_bb = await page.locator(f"text={ubicacion}").last.bounding_box()
+await page.mouse.click(1371, lach_bb['y'] + lach_bb['height'] / 2)
+```
+
+Si se abre el menú ⋮ en vez de expandirse la card, el click fue demasiado a la izquierda — ajustar x a un valor mayor.
+
+### Expandir sección del acordeón en modal «Archivos adjuntos»
+
+El modal tiene dos secciones. Para expandir la 2a (adjuntos de la línea):
+
+```python
+second = page.locator('text=Archivos "').nth(1)
+bb = await second.bounding_box()
+await page.mouse.click(bb['x'] + bb['width'] / 2, bb['y'] + bb['height'] / 2)
+await page.wait_for_timeout(500)
+```
+
+### Elementos «not visible» para Playwright
+
+Algunos elementos existen en el DOM y tienen coordenadas reales pero Playwright los considera `not visible` (ej. el `<span>Agregar adjunto</span>`). `locator.click()` lanza `TimeoutError: element is not visible`.
+
+Solución: obtener `bounding_box()` directamente y usar `page.mouse.click(cx, cy)`:
+
+```python
+span = page.locator("text=Agregar adjunto").first
+bb = await span.bounding_box()
+if bb:
+    await page.mouse.click(bb['x'] + bb['width'] / 2, bb['y'] + bb['height'] / 2)
+```
 
 ### React Selects
 Los campos de selección en Y-Click son React Selects (no `<select>` HTML). Para elegir una opción:
@@ -247,6 +323,7 @@ Los inputs de modales (ej. doc_respaldo, cantidad) son inputs React. Para que el
 | Celda con cantidad ya cargada | Esa celda: `ya_existia`; no toca nada |
 | Valor leído distinto del payload | No envía esa celda: `valor_no_coincide` |
 | Falla al descargar o adjuntar el PDF | La celda queda `error` con detalle (las horas ya estaban enviadas) |
+| Y-Click muestra error interno al adjuntar (ej. `7d06b39a`) | `adjunto_no_confirmado` + texto exacto del error; puede ocurrir si la línea ya fue aprobada |
 | Aviso o error propio de Y-Click | Copiar el texto exacto al detalle y sacar captura |
 | Tope de pasos o minutos superado | Esa celda: `tope_excedido` |
 
@@ -298,7 +375,7 @@ Se dicen acá para que el bot sepa que **no** las decide él:
 - [x] Íconos de la fila: orden confirmado en prod (supporting_document=0, send_work_report=1, archivos=2, notas=3, menú=4).
 - [ ] Un caso con horas al 50% o 100%, y uno con KM.
 - [ ] Qué muestra Y-Click ante un error o un duplicado.
-- [x] Fin de semana: posición 25 con cantidad en días; con dos pozos el mismo día se reparte (ver sección 7).
+- [x] Fin de semana: posición 25 with cantidad en días; con dos pozos el mismo día se reparte (ver sección 7).
 - [ ] ⚠️ Fin de semana con **un solo parte que no cubre las 8 a 17** (ej. 12 a 17) y sin otra operación ese día: ¿1 día entero o la fracción de horas?
 - [ ] ⚠️ Qué horas extra van al **50%** y cuáles al **100%** (de semana y en fin de semana).
 - [ ] ⚠️ Excel de posiciones **con las negritas de Fabio** (equipo ↔ posición).
@@ -309,5 +386,8 @@ Se dicen acá para que el bot sepa que **no** las decide él:
 - [x] Chromium: usar `/opt/pw-browsers/chromium-1243/chrome-linux64/chrome` con `executable_path`.
 - [x] Date picker: navegar con JS (`ariaDivs[1/2].click()` dentro de `page.evaluate()`) — el picker puede estar fuera del viewport (confirmado en prod 10/11/2026).
 - [x] Doc_respaldo: 1er ícono → modal «Identificador de Documento de Respaldo» → `input[name='identifier']` → mouse click + keyboard.type (NO JS setter) → Guardar (confirmado en prod 10/11/2026).
-- [x] PDF adjunto: 3er ícono → modal «Archivos adjuntos» → expandir 2a sección → `input[type=file]` con `set_input_files()` → «Agregar» (confirmado en prod 10/11/2026).
+- [x] PDF adjunto: 3er ícono (por DOM, ver sección 4) → modal «Archivos adjuntos» → expandir 2a sección con mouse.click por coordenadas → «Agregar adjunto» con mouse.click (not visible para locator) → `input[type=file]` con `set_input_files()` → botón «Agregar» (NO «Aceptar») → toast «Adjuntando archivos» (confirmado en sesión 12/11/2026).
 - [x] Resultado Wells: `wells_api.py resultado` con campo `estado` obligatorio (HTTP 422 sin él). Sin llamar `resultado`, el sync queda «En proceso» indefinidamente (confirmado en prod 10/11/2026).
+- [ ] ⚠️ Error Y-Click `7d06b39a` al adjuntar: ocurrió en sesión 12/11/2026 en línea posiblemente ya aprobada. Investigar si es por estado de la línea o por otro motivo. Confirmar si el adjunto se puede hacer en líneas aprobadas.
+- [x] Botones de fila: encontrar por DOM (posición y relativa al código de posición, ordenar por x) — no por clase CSS sola (confirmado 12/11/2026).
+- [x] Invocación del bot: `bot_yclick.py <sync_json_path>` — toma la ruta al JSON, no el sync_id directamente.

@@ -403,16 +403,25 @@ async def run(sync_data):
                         log(f"  Tipo elegido: {tipo_elegido}")
                     else:
                         log(f"  WARN: sin opciones para tipo '{kw_tipo}', continuando sin tipo")
-                    await asyncio.sleep(2)  # esperar que aparezca Ubicación locación
+                    await asyncio.sleep(2)  # esperar que aparezca el campo de ubicación
 
-                    # Ubicación locación — buscar con "LOC" (trae resultados) y matchear "56"
+                    # Campo de ubicación: label y término de búsqueda dependen del tipo elegido
+                    # Pozo → "Ubicación pozo" / Locación → "Ubicación locación"
                     chk_tope()
-                    log(f"  Ubicación locación: '{yclick_ubicacion}'")
-                    # Extraer número de locación para el match (ej: "56" de "LOCACION N° 56")
                     import re as _re_ub
-                    num_loc = _re_ub.search(r'\d+', yclick_ubicacion)
-                    match_ub = num_loc.group(0) if num_loc else yclick_ubicacion[:8]
-                    ub_elegida = await fill_generic_select_by_label("locaci", "LOC", match_term=match_ub, wait_s=4.0)
+                    if kw_tipo == "Pozo":
+                        label_ub = "pozo"
+                        # Buscar sin sufijo entre paréntesis: "LLL-1283(h)" -> "LLL-1283"
+                        search_ub = _re_ub.sub(r'\s*\([^)]*\)\s*$', '', yclick_ubicacion).strip()
+                        match_ub = yclick_ubicacion
+                        log(f"  Ubicación pozo: search='{search_ub}' match='{match_ub}'")
+                    else:
+                        label_ub = "locaci"
+                        search_ub = "LOC"
+                        num_loc = _re_ub.search(r'\d+', yclick_ubicacion)
+                        match_ub = num_loc.group(0) if num_loc else yclick_ubicacion[:8]
+                        log(f"  Ubicación locación: '{yclick_ubicacion}'")
+                    ub_elegida = await fill_generic_select_by_label(label_ub, search_ub, match_term=match_ub, wait_s=4.0)
                     if not ub_elegida:
                         await screenshot(page, f"ub_noencontrada_{celda_id[:8]}")
                         raise Exception(f"ubicacion_no_encontrada: '{yclick_ubicacion}' (match='{match_ub}') no aparece en opciones")

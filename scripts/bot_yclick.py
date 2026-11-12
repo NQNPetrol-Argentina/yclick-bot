@@ -572,20 +572,38 @@ async def run(sync_data):
                 else:
                     log("  WARN: no se encontró el div de ubicación para expandir la card")
 
-                # 2. Verificar si ya tiene líneas: el botón "Agregar líneas" solo aparece cuando NO hay líneas
-                #    Cuando hay líneas, ese botón desaparece y aparece el picker de fecha
-                await asyncio.sleep(0.5)
-                _btn_al = await page.query_selector("button:has-text('Agregar líneas')")
+                # 2. Verificar si ya tiene líneas con evidencia POSITIVA:
+                #    buscar el texto de la posición en pantalla. No inferir de la ausencia del
+                #    botón "Agregar líneas": si la card no se expandió, el botón tampoco es visible
+                #    pero la línea no existe — eso era un falso positivo (bug detectado en prod).
+                await asyncio.sleep(0.8)
+                _linea_marker = f"{posicion_codigo} - "
+                _linea_en_pantalla = False
+                for _el in await page.query_selector_all("div, span"):
+                    try:
+                        _t = (await _el.inner_text()).strip()
+                        if _linea_marker in _t and len(_t) < 150:
+                            _linea_en_pantalla = True
+                            break
+                    except Exception:
+                        pass
+
+                # Buscar "Agregar líneas" con selector amplio (puede ser button, div o a)
+                _btn_al = None
+                for _sel_al in ["button:has-text('Agregar líneas')", "[class*='btn']:has-text('Agregar líneas')", "text='Agregar líneas'"]:
+                    _btn_al = await page.query_selector(_sel_al)
+                    if _btn_al:
+                        break
                 _btn_al_visible = False
                 if _btn_al:
                     try:
                         _btn_al_visible = await _btn_al.is_visible()
                     except Exception:
                         pass
-                _linea_marker = f"{posicion_codigo} - "
-                linea_ya_existe = not _btn_al_visible
+
+                linea_ya_existe = _linea_en_pantalla and not _btn_al_visible
                 if linea_ya_existe:
-                    log(f"  Línea Posición {posicion_codigo} ya existe (botón 'Agregar líneas' no visible)")
+                    log(f"  Línea Posición {posicion_codigo} ya existe (encontrada en pantalla)")
                 else:
                     # Click en "Agregar líneas" (el botón está visible, puede estar fuera del viewport)
                     chk_tope()

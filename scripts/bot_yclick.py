@@ -448,7 +448,7 @@ async def run(sync_data):
                             pass
                     # Botón confirmar: usar JS click para esquivar cualquier overlay restante
                     confirmar_clicked = False
-                    for btn_txt in ["Agregar y continuar", "Continuar", "Agregar"]:
+                    for btn_txt in ["Agregar", "Continuar", "Agregar y continuar"]:
                         try:
                             btn_el = await page.query_selector(f"button:has-text('{btn_txt}')")
                             if btn_el and await btn_el.is_enabled():

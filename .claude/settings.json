@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(/usr/bin/python3 -I scripts/bot_yclick.py *)",
+      "Bash(/usr/bin/python3 -I scripts/wells_api.py *)",
+      "Bash(/usr/bin/python3 -m pip install playwright*)"
+    ]
+  },
+  "autoMode": {
+    "allow": [
+      "$defaults",
+      "Bash(/usr/bin/python3 -I scripts/bot_yclick.py *)",
+      "Bash(/usr/bin/python3 -I scripts/wells_api.py *)"
+    ]
+  }
+}

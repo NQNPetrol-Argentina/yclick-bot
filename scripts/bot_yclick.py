@@ -895,72 +895,130 @@ async def run(sync_data):
                     chk_tope()
                     log(f"  Paso 8: Adjuntar PDF {pdf_local}")
                     try:
-                        # Encontrar el ícono de adjunto en la fila de la línea
-                        # La fila tiene: texto posición | texto línea | unidad | input cantidad | iconos
-                        # El ícono de adjunto (documento) está cerca de linea_row_y
+                        # Encontrar el 3er ícono de la fila (clase button_work_report, el más
+                        # a la izquierda de los que tienen esa clase — x ≈ 1193).
+                        # Orden confirmado en prod: [0]=supporting_document [1]=button_send_work_report
+                        # [2]=button_work_report(archivos) [3]=button_work_report(notas) [4]=button_work_report_menu
                         adj_clicked = False
-                        # Buscar por aria-label, title, o class en la zona de la fila
-                        for _adj_sel in [
-                            "[aria-label*='djunt'], [title*='djunt']",
-                            "[aria-label*='archivo'], [title*='archivo']",
-                            "[class*='attach'], [class*='file-upload']",
-                            "[class*='document'], [class*='doc']",
-                        ]:
-                            try:
-                                _adj_els = await page.query_selector_all(_adj_sel)
-                                for _adj_el in _adj_els:
-                                    _bb = await _adj_el.bounding_box()
-                                    if _bb and linea_row_y and abs(_bb["y"] - linea_row_y) < 60:
-                                        await _adj_el.click(timeout=3000)
-                                        adj_clicked = True
-                                        log(f"  Ícono adjunto clickeado ({_adj_sel})")
-                                        break
-                            except Exception:
-                                pass
-                            if adj_clicked:
-                                break
-
-                        # Fallback: buscar ícono SVG de documento en la fila
-                        if not adj_clicked and linea_row_y:
-                            svgs_en_fila = await page.evaluate(f"""() => {{
-                                const svgs = Array.from(document.querySelectorAll('svg, button'));
-                                return svgs
-                                    .filter(e => {{
-                                        const r = e.getBoundingClientRect();
-                                        return r.x > 1200 && Math.abs(r.y - {linea_row_y}) < 60;
-                                    }})
-                                    .map((e, i) => ({{idx: i, x: e.getBoundingClientRect().x, y: e.getBoundingClientRect().y, tag: e.tagName, cls: e.className}}));
-                            }}""")
-                            log(f"  SVGs/botones en fila: {svgs_en_fila}")
-                            # El ícono de adjunto es típicamente el 3ro de derecha a izquierda
-                            if len(svgs_en_fila) >= 3:
-                                target_icon = sorted(svgs_en_fila, key=lambda x: x["x"])[-3]
-                                await page.mouse.click(target_icon["x"] + 5, target_icon["y"] + 5)
+                        if linea_row_y:
+                            # Primero intentar por clase exacta button_work_report
+                            _bwr_els = await page.query_selector_all(".button_work_report")
+                            _bwr_en_fila = []
+                            for _el in _bwr_els:
+                                _bb = await _el.bounding_box()
+                                if _bb and abs(_bb["y"] - linea_row_y) < 60 and _bb["x"] > 1050:
+                                    _bwr_en_fila.append((_bb["x"], _el))
+                            if _bwr_en_fila:
+                                # El más a la izquierda es el de Archivos adjuntos
+                                _bwr_en_fila.sort(key=lambda t: t[0])
+                                _icono_adj = _bwr_en_fila[0][1]
+                                _bb_adj = await _icono_adj.bounding_box()
+                                await _icono_adj.evaluate("el => el.click()")
                                 adj_clicked = True
-                                log(f"  Click en ícono adjunto por posición ({target_icon['x']:.0f},{target_icon['y']:.0f})")
+                                log(f"  Ícono adjunto (button_work_report) clickeado en x≈{_bb_adj['x']:.0f}")
+                            else:
+                                # Fallback: todos los botones/SVG de la fila con x > 1050,
+                                # ordenar por x ascendente, el 3ro es el de archivos adjuntos
+                                svgs_en_fila = await page.evaluate(f"""() => {{
+                                    const els = Array.from(document.querySelectorAll('button, svg'));
+                                    return els
+                                        .filter(e => {{
+                                            const r = e.getBoundingClientRect();
+                                            return r.x > 1050 && r.width > 0 && r.height > 0
+                                                && Math.abs(r.y - {linea_row_y}) < 60;
+                                        }})
+                                        .map((e, i) => ({{idx: i, x: e.getBoundingClientRect().x, y: e.getBoundingClientRect().y, tag: e.tagName, cls: e.className}}));
+                                }}""")
+                                log(f"  Fallback SVGs/botones en fila: {svgs_en_fila}")
+                                # Excluir button_work_report_menu y button_send_work_report;
+                                # de los restantes ordenados por x, tomar el 1ro (archivos)
+                                candidatos = [s for s in svgs_en_fila
+                                              if "menu" not in str(s.get("cls", "")).lower()
+                                              and "send" not in str(s.get("cls", "")).lower()]
+                                candidatos.sort(key=lambda s: s["x"])
+                                if len(candidatos) >= 3:
+                                    target = candidatos[2]  # índice 2 = adjuntos
+                                    await page.evaluate(f"""() => {{
+                                        const els = Array.from(document.querySelectorAll('button, svg'));
+                                        const t = els.filter(e => {{
+                                            const r = e.getBoundingClientRect();
+                                            return Math.abs(r.x - {target['x']}) < 5 && Math.abs(r.y - {target['y']}) < 5;
+                                        }})[0];
+                                        if (t) t.click();
+                                    }}""")
+                                    adj_clicked = True
+                                    log(f"  Fallback click en candidatos[2] x≈{target['x']:.0f}")
 
                         if adj_clicked:
-                            await asyncio.sleep(0.8)
-                            # Buscar "Agregar adjunto" o "Subir archivo" en el popup/modal
-                            for _add_txt in ["Agregar adjunto", "Subir", "Agregar archivo"]:
-                                try:
-                                    _btn = await page.query_selector(f"text={_add_txt}")
-                                    if _btn:
-                                        await _btn.click(timeout=3000)
-                                        await asyncio.sleep(0.3)
-                                        break
-                                except Exception:
-                                    pass
-                            async with page.expect_file_chooser(timeout=5000) as fc_info:
-                                await page.click("input[type='file'], button:has-text('Seleccionar'), button:has-text('Elegir')", timeout=3000)
-                            fc = await fc_info.value
-                            await fc.set_files(pdf_local)
+                            await asyncio.sleep(1.0)
+                            # Expandir la 2ª sección del acordeón (archivos de esta línea).
+                            # La sección empieza colapsada. Su cabecera contiene "Archivos"
+                            # pero NO "solicitud". Y-Click usa comillas tipográficas (“/”)
+                            # así que la búsqueda se hace por JS sobre innerText sin asumir el tipo de comilla.
+                            _sec_expandida = await page.evaluate("""() => {
+                                const all = Array.from(document.querySelectorAll('*'));
+                                for (const el of all) {
+                                    const r = el.getBoundingClientRect();
+                                    if (r.width < 200 || r.height < 15 || r.height > 120) continue;
+                                    const txt = (el.innerText || '').trim();
+                                    if (txt.startsWith('Archivos') && !txt.includes('solicitud')) {
+                                        el.click();
+                                        return txt.substring(0, 80);
+                                    }
+                                }
+                                return null;
+                            }""")
+                            if _sec_expandida:
+                                log(f"  Sección línea expandida: {_sec_expandida[:60]}")
+                                await asyncio.sleep(0.8)
+                            else:
+                                log("  WARN: sección de línea no encontrada, continuando igual")
+
+                            # Hacer click en "Agregar adjunto" (aparece tras expandir la sección)
+                            # para que el input[type=file] aparezca en el DOM.
+                            _agregar_ok = await page.evaluate("""() => {
+                                const all = Array.from(document.querySelectorAll('button, a, span'));
+                                for (const el of all) {
+                                    const txt = (el.innerText || el.textContent || '').trim();
+                                    if (txt.includes('Agregar adjunto') || txt.includes('Agregar archivo')) {
+                                        el.click();
+                                        return txt;
+                                    }
+                                }
+                                return null;
+                            }""")
+                            if _agregar_ok:
+                                log(f"  Click en '{_agregar_ok}' via JS")
+                                await asyncio.sleep(0.8)
+                            else:
+                                log("  WARN: botón 'Agregar adjunto' no encontrado")
+
+                            # Usar set_input_files() directamente sobre el input[type=file]
+                            # (NO simular click en el input — doc Paso 8 punto 5)
+                            _file_input = await page.query_selector("input[type='file']")
+                            if not _file_input:
+                                await asyncio.sleep(1.0)
+                                _file_input = await page.query_selector("input[type='file']")
+                            if not _file_input:
+                                raise Exception("input[type='file'] no encontrado tras click en 'Agregar adjunto'")
+                            await _file_input.set_input_files(pdf_local)
                             await asyncio.sleep(0.5)
-                            await page.click("button:has-text('Agregar'), button:has-text('Subir'), button:has-text('OK')", timeout=5000)
-                            await page.wait_for_load_state("networkidle", timeout=20000)
-                            log("  PDF adjuntado")
+                            # Click en "Agregar" (botón distinto del "Agregar adjunto")
+                            await page.click(
+                                "button:has-text('Agregar'):not(:has-text('adjunto')), "
+                                "button:has-text('Subir'), button:has-text('OK')",
+                                timeout=5000
+                            )
+                            await asyncio.sleep(1.5)
+                            # Verificar que el nombre del PDF aparece en la lista
+                            pdf_nombre = os.path.basename(pdf_local)
+                            _lista_txt = await page.inner_text("body")
+                            if pdf_nombre in _lista_txt:
+                                log(f"  PDF adjuntado y verificado: {pdf_nombre}")
+                            else:
+                                log(f"  WARN adjunto_no_confirmado: nombre '{pdf_nombre}' no encontrado en página tras Agregar")
                         else:
-                            raise Exception("No se encontró ícono de adjunto en la fila")
+                            raise Exception("No se encontró ícono de adjunto (button_work_report) en la fila")
                     except Exception as e:
                         log(f"  WARN adjunto (no critico, horas ya enviadas): {e}")
 

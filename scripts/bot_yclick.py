@@ -672,6 +672,13 @@ async def run(sync_data):
                     await page.wait_for_load_state("networkidle", timeout=15000)
                     await asyncio.sleep(1.5)
                     log("  Modal posición/línea cerrado")
+                    # Expandir la card después de agregar la línea (la card puede seguir colapsada
+                    # si el primer intento falló antes de abrir el modal)
+                    _exp_ok2 = await expandir_card()
+                    if _exp_ok2:
+                        log("  Card expandida post-modal")
+                    else:
+                        log("  WARN: no se pudo expandir la card post-modal")
 
                 # Paso 5: Cantidad en el grid diario
                 chk_tope()
